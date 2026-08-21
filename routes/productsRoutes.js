@@ -7,16 +7,29 @@ const {
     getProductById,
     deleteProduct,
     createProduct,
-    patchProduct
-} = require("../controllers/productsController");
+    updateProduct
+   } = require("../controllers/productsController");
 
-router.get("/", getProducts);
-router.get("/:id", getProductById);
+   const validateProducts = require("../middleware/productsMiddleware");
+   const validateId = require("../middleware/IdMiddleware");
+   const authMiddleware = require("../middleware/authMiddleware");
+   const adminMiddleware = require("../middleware/roleMiddleware");
 
-router.post("/", createProduct);
+router.get("/", authMiddleware,getProducts);
 
-router.patch("/:id", patchProduct);
+router.get("/:id", validateId, getProductById);
+
+router.post("/", validateProducts, createProduct,);
+
+router.put("/:id", updateProduct);
 
 router.delete("/:id", deleteProduct);
+
+router.delete(
+    "/:id",
+    authMiddleware,
+    adminMiddleware,
+    deleteProduct
+);
 
 module.exports = router;

@@ -2,26 +2,56 @@
 const pool = require("../config/database");
 
 const getProducts = async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT 
+                products.id,
+                products.nama,
+                products.qty,
+                products.harga,
+                products.id_kategori,
+                kategori.nama AS nama_kategori,
+                products.aktif
+             FROM products
+             JOIN kategori
+                ON products.id_kategori = kategori.id
+             WHERE products.aktif = true`
+        );
 
-    const result = await pool.query(
-        "SELECT * FROM products"
-    );
+        res.json({
+            pesan: "Produk berhasil ditemukan",
+            data: result.rows
+        });
 
-    res.json({
-        pesan: "Produk berhasil ditemukan",
-        data: result.rows
-    });
+    } catch (error) {
+        console.error("ERROR GET PRODUCTS:", error);
 
+        res.status(500).json({
+            pesan: "Terjadi kesalahan pada server"
+        });
+    }
 };
 
 const getProductById = async (req, res) => {
 
     const id = req.params.id;
 
+    if (isNaN(id)) {
+        return res.status(400).json({
+            pesan: "ID harus berupa angka"
+        });
+    }
+
     const result = await pool.query(
         "SELECT * FROM products WHERE id = $1",
         [id]
     );
+
+    if (result.rows.length === 0) {
+        return res.status(400).json({
+            pesan: "produk tidak ditemukan"
+        });
+    }
 
     res.json({
         pesan: "Produk berhasil ditemukan",
@@ -30,39 +60,54 @@ const getProductById = async (req, res) => {
 
 };
 
-
 const deleteProduct = async (req, res) => {
+    try {
+        const id = req.params.id;
 
-    const id = req.params.id;
+        if (isNaN(id)) {
+            return res.status(400).json({
+                pesan: "ID harus berupa angka"
+            });
+        }
 
-    const result = await pool.query(
-        "DELETE FROM products WHERE id = $1 RETURNING *",
-        [id]
-    );
+        const result = await pool.query(
+            `UPDATE products
+             SET aktif = false
+             WHERE id = $1
+             RETURNING *`,
+            [id]
+        );
 
-    if (result.rows.length === 0) {
-        return res.status(404).json({
-            pesan: "Produk tidak ditemukan"
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                pesan: "Produk tidak ditemukan"
+            });
+        }
+
+        res.json({
+            pesan: "Produk berhasil dinonaktifkan",
+            data: result.rows[0]
+        });
+
+    } catch (error) {
+        console.error("ERROR:", error);
+
+        res.status(500).json({
+            pesan: "Terjadi kesalahan pada server"
         });
     }
-
-    res.json({
-        pesan: "Produk berhasil dihapus",
-        data: result.rows[0]
-    });
-
 };
 
 const createProduct = async (req, res) => {
   try {
-    const { nama, qty, satuan } = req.body;
+    const { nama, qty, id_kategori } = req.body;
 
     console.log("MASUK CREATE PRODUK");
-    console.log("DATA:", nama, qty, satuan);
+    console.log("DATA:", nama, qty, id_kategori);
 
-    if (!nama || qty === undefined || satuan === undefined) {
+    if (!nama || qty === undefined || id_kategori === undefined) {
       return res.status(400).json({
-        pesan: "Data nama, qty, dan satuan wajib diisi"
+        pesan: "Data nama, qty, dan id_kategori wajib diisi"
       });
     }
 
@@ -86,21 +131,21 @@ const createProduct = async (req, res) => {
       });
     }
 
-    if (typeof qty !== "number" || typeof satuan !== "number") {
+    if (typeof qty !== "number" || typeof id_kategori !== "number") {
       return res.status(400).json({
-        pesan: "qty dan satuan harus berupa angka"
+        pesan: "qty dan id_kategore harus berupa angka"
       });
     }
 
-    if (qty <= 0 || satuan <= 0) {
+    if (qty <= 0 || id_kategori <= 0) {
       return res.status(400).json({
-        pesan: "qty dan satuan harus lebih dari 0"
+        pesan: "qty dan id_kategori harus lebih dari 0"
       });
     }
 
     const result = await pool.query(
-      "INSERT INTO products (nama, qty, satuan) VALUES ($1, $2, $3) RETURNING *",
-      [nama, qty, satuan]
+      "INSERT INTO products (nama, qty, id_kategori) VALUES ($1, $2, $3) RETURNING *",
+      [nama, qty, id_kategori]
     );
 
     res.status(201).json({
@@ -117,39 +162,91 @@ const createProduct = async (req, res) => {
   }
 };
 
+const updateProduct = async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { nama, qty, id_kategori } = req.body;
 
-const patchProduct = async (req, res) => {
-  const id = req.params.id;
-  const { nama, qty, satuan } = req.body;
+    if (isNaN(id)) {
+      return res.status(400).json({
+        pesan: "ID harus berupa angka"
+      });
+    }
 
-  const result = await pool.query(
-    `UPDATE products
-     SET nama = COALESCE($1, nama),
-         qty = COALESCE($2, qty),
-         satuan = COALESCE($3, satuan)
-     WHERE id = $4
-     RETURNING *`,
-    [nama, qty, satuan, id]
-  );
+    console.log("MASUK UPDATE PRODUK");
+    console.log("ID:", id);
+    console.log("DATA:", nama, qty, id_kategori);
 
-  if (result.rows.length === 0) {
-    return res.status(404).json({
-      pesan: "Produk tidak ditemukan"
+    if (!nama || qty === undefined || id_kategori === undefined) {
+      return res.status(400).json({
+        pesan: "Data nama, qty, dan id_kategori wajib diisi"
+      });
+    }
+
+    if (typeof nama !== "string") {
+      return res.status(400).json({
+        pesan: "nama harus berupa teks"
+      });
+    }
+
+    if (nama.trim() === "") {
+      return res.status(400).json({
+        pesan: "nama tidak boleh kosong"
+      });
+    }
+
+    if (nama.length > 100) {
+      return res.status(400).json({
+        pesan: "nama maksimal 100 karakter"
+      });
+    }
+
+    if (typeof qty !== "number" || typeof id_kategori !== "number") {
+      return res.status(400).json({
+        pesan: "qty dan id_kategori harus berupa angka"
+      });
+    }
+
+    if (qty <= 0 || id_kategori <= 0) {
+      return res.status(400).json({
+        pesan: "qty dan id_kategori harus lebih dari 0"
+      });
+    }
+
+    const result = await pool.query(
+      `UPDATE products
+       SET nama = $1, qty = $2, id_kategori = $3
+       WHERE id = $4
+       RETURNING *`,
+      [nama, qty, id_kategori, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        pesan: "Produk tidak ditemukan"
+      });
+    }
+
+    res.json({
+      pesan: "Produk berhasil diubah",
+      data: result.rows[0]
+    });
+
+  } catch (error) {
+    console.error("ERROR:", error);
+
+    res.status(500).json({
+      pesan: "Terjadi kesalahan pada server"
     });
   }
-
-  res.json({
-    pesan: "Produk berhasil diubah sebagian",
-    data: result.rows[0]
-  });
 };
 
-
+  
 module.exports = { 
     getProducts, 
     getProductById,
     deleteProduct,
     createProduct,
-    patchProduct
+    updateProduct
 
 };
