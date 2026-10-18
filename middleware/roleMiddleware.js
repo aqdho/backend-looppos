@@ -1,11 +1,11 @@
-const adminMiddleware = (req, res, next) => {
+const ownerMiddleware = (req, res, next) => {
 
     console.log("USER DARI TOKEN:", req.user);
 
-    if (req.user.role !== "admin") {
+    if (req.user.role !== "owner") {
 
         return res.status(403).json({
-            pesan: "Akses ditolak"
+            pesan: "Akses hanya untuk owner"
         });
 
     }
@@ -14,4 +14,4 @@ const adminMiddleware = (req, res, next) => {
 
 };
 
-module.exports = adminMiddleware;
+module.exports = ownerMiddleware;

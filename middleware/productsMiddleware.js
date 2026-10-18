@@ -1,9 +1,14 @@
 const validateProducts = (req, res, next) => {
-    const { nama, qty, id_kategori } = req.body;
+    const { nama, qty, harga, id_kategori } = req.body;
 
-    if (nama === undefined || qty === undefined || id_kategori === undefined) {
+    if (
+        nama === undefined ||
+        qty === undefined ||
+        harga === undefined ||
+        id_kategori === undefined
+    ) {
         return res.status(400).json({
-            pesan: "nama, qty, dan id_kategori wajib diisi"
+            pesan: "nama, qty, harga, dan id_kategori wajib diisi"
         });
     }
 
@@ -13,30 +18,43 @@ const validateProducts = (req, res, next) => {
         });
     }
 
-    if (typeof qty !== "number") {
+    const qtyNumber = Number(qty);
+    const hargaNumber = Number(harga);
+    const kategoriNumber = Number(id_kategori);
+
+    if (isNaN(qtyNumber)) {
         return res.status(400).json({
             pesan: "qty harus berupa angka"
         });
     }
 
-    if (typeof id_kategori !== "number") {
+    if (isNaN(kategoriNumber)) {
         return res.status(400).json({
             pesan: "id_kategori harus berupa angka"
         });
     }
 
-    if (qty < 0) {
+    if(qtyNumber < 0) {
         return res.status(400).json({
             pesan: "qty harus lebih dari 0"
         });
     }
 
-    if (id_kategori < 0) {
+    if (isNaN(hargaNumber)) {
+        return res.status(400).json({
+            pesan: "harga harus berupa angka"
+        });
+    }
+
+    if (kategoriNumber < 0) {
         return res.status(400).json({
             pesan: "id_kategori harus lebih dari 0"
         });
     }
 
+    req.body.qty = qtyNumber;
+    req.body.harga = hargaNumber;
+    req.body.id_kategori = kategoriNumber;
 
     next();
 };

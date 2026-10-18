@@ -7,28 +7,51 @@ const {
     getProductById,
     deleteProduct,
     createProduct,
-    updateProduct
+    importProducts,
+    updateProduct,
+    tambahStok
    } = require("../controllers/productsController");
 
    const validateProducts = require("../middleware/productsMiddleware");
    const validateId = require("../middleware/IdMiddleware");
    const authMiddleware = require("../middleware/authMiddleware");
-   const adminMiddleware = require("../middleware/roleMiddleware");
+   const ownerMiddleware = require("../middleware/roleMiddleware");
+   const upload = require("../middleware/uploadMiddleware");
 
-router.get("/", authMiddleware,getProducts);
+router.get("/", authMiddleware, getProducts);
 
-router.get("/:id", validateId, getProductById);
+router.get("/:id", authMiddleware, validateId, getProductById);
 
-router.post("/", validateProducts, createProduct,);
+router.post(
+    "/",
+    authMiddleware,
+    ownerMiddleware,
+    upload.single("gambar"),
+    validateProducts,
+    createProduct
+);
 
-router.put("/:id", updateProduct);
+router.post(
+    "/import",
+    authMiddleware,
+    ownerMiddleware,
+    importProducts
+);
 
-router.delete("/:id", deleteProduct);
+router.put(
+    "/:id",
+    authMiddleware,
+    ownerMiddleware,
+    upload.single("gambar"),
+    updateProduct
+);
+
+router.put("/:id/stok", authMiddleware, ownerMiddleware, tambahStok);
 
 router.delete(
     "/:id",
     authMiddleware,
-    adminMiddleware,
+    ownerMiddleware,
     deleteProduct
 );
 

@@ -1,13 +1,19 @@
+require("dotenv").config();
+
 const { Pool } = require("pg");
 
-
 const pool = new Pool({
-    user: "postgres",
-    host: "localhost",
-    database: "belajar_backend",
-    password: "postgres",
-    port: 5432
+    connectionString: process.env.DATABASE_URL,
+
+    ssl: process.env.DATABASE_URL
+        ? { rejectUnauthorized: false }
+        : false,
+
+    connectionTimeoutMillis: 10000,
 });
 
+pool.on("error", (err) => {
+    console.error("[DATABASE] Unexpected PostgreSQL error:", err.message);
+});
 
 module.exports = pool;
