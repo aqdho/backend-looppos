@@ -80,8 +80,11 @@ app.use((req, res, next) => {
 // =====================================================
 
 app.get("/", (req, res) => {
-
-    res.send("Halo Dunia");
+    res.json({ 
+        status: "ok",
+        aplikasi: "LoopPOS Backend",
+        message: "Backend LoopPOS aktif"
+    });   
 
 });
 
