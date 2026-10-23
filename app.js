@@ -12,6 +12,7 @@ const authMiddleware = require("./middleware/authMiddleware");
 const productsRoutes = require("./routes/productsRoutes");
 const authRoutes = require("./auth/authRoutes");
 const usersRoutes = require("./users/usersRoutes");
+const subscriptionRoutes = require("./routes/subscriptionRoutes");
 const kategoriRouter = require("./kategori/kategoriRoutes");
 const transaksiDetailRoutes = require("./routes/transaksiDetailRoutes");
 const transaksiRoutes = require("./routes/transaksiRoutes");
@@ -188,6 +189,10 @@ app.use(
     "/users",
     usersRoutes
 );
+
+app.use(
+    "/subscription", 
+    subscriptionRoutes);
 
 app.use(
     "/kategori",

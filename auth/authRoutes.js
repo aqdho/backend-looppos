@@ -300,6 +300,22 @@ router.post("/register", async (req, res) => {
     try {
         await client.query("BEGIN");
 
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id BIGSERIAL PRIMARY KEY,
+                owner_id INTEGER NOT NULL UNIQUE
+                    REFERENCES users(id) ON DELETE CASCADE,
+                plan VARCHAR(30) NOT NULL DEFAULT 'trial'
+                    CHECK (plan IN ('trial', 'starter', 'pro', 'enterprise')),
+                status VARCHAR(20) NOT NULL DEFAULT 'trialing'
+                    CHECK (status IN ('trialing', 'active', 'expired', 'pending')),
+                started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        `);
+
         // Cek email sudah digunakan.
         const existingUser = await client.query(
             `SELECT id
@@ -349,6 +365,15 @@ router.post("/register", async (req, res) => {
         );
 
         const user = result.rows[0];
+
+        await client.query(
+            `INSERT INTO subscriptions
+                (owner_id, plan, status, started_at, expires_at)
+            VALUES
+                ($1, 'trial', 'trialing', NOW(), NOW() + INTERVAL '14 days')
+            ON CONFLICT (owner_id) DO NOTHING`,
+            [user.id]
+        );
 
         // Buat setting toko otomatis.
         await client.query(
