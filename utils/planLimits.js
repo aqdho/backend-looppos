@@ -54,7 +54,7 @@ async function getPlanUsage(db, ownerId) {
     plan, 
     limits: PLAN_LIMITS[plan],
     productCount: productsResult.rows[0].total, 
-    cashierCount: cashiersResult.rows[0].total,
+    cashierCount: cashierResult.rows[0].total,
   };
 }
 
