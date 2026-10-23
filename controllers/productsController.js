@@ -1,5 +1,7 @@
 const pool = require("../config/database");
 
+const { getPlanUsage } = require("../utils/planLimits");
+
 // Semua operasi produk memakai ID owner,
 // termasuk ketika pengguna yang login adalah kasir.
 async function resolveOwnerId(userId) {
@@ -190,6 +192,15 @@ const createProduct = async (req, res) => {
       });
     }
 
+    const usage = await getPlanUsage(pool, userId);
+
+    if (usage.productCount >= usage.limits.products) { 
+      return res.status(403).json({ 
+        code: "PLAN_LIMIT_REACHED",
+        pesan: `Paket ${usage.plan} sudah mencapai batas produk. Hapus atau nonaktifkan produk yang tidak digunakan, atau tingkatkan paket.`,
+      });
+    }
+
     const {
       nama,
       qty,
@@ -337,6 +348,18 @@ const importProducts = async (req, res) => {
     if (!userId) {
       return res.status(403).json({
         pesan: "User belum memiliki owner."
+      });
+    }
+
+    const usage = await getPlanUsage(pool, userId);
+    const jumlahProdukBaru = Array.isArray(req.body.products)
+      ? req.body.products.length
+      : 0; 
+
+    if (usage.productCount + jumlahProdukBaru > usage.limits.products) { 
+      return res.status(403).json({ 
+        code: "PLAN_LIMIT_REACHED",
+        pesan: `Impor dibatalkan. Paket ${usage.plan} hanya mengizinkan ${usage.limits.products} produk.`,
       });
     }
 

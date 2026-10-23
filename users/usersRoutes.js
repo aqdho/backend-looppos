@@ -1,6 +1,7 @@
 const express = require("express");
 const pool = require("../config/database");
 const authMiddleware = require("../middleware/authMiddleware");
+const { getPlanUsage } = require("../utils/planLimits");
 
 const router = express.Router();
 
@@ -143,6 +144,26 @@ router.post("/kasir", authMiddleware, async (req, res) => {
         if (usernameCheck.rows.length > 0) {
             return res.status(400).json({
                 pesan: "Username sudah digunakan"
+            });
+        }
+
+        // CEK BATAS KASIR SESUAI PAKET LANGGANAN
+
+        const usage = await getPlanUsage(pool, req.user.id);
+
+        const kasirAktifResult = await pool.query( 
+            `SELECT COUNT(*)::int AS jumlah
+            FROM users
+            WHERE owner_id = $1
+              AND role = 'kasir'
+              AND aktif = true`,
+            [req.user.id]
+        );
+
+        if (kasirAktifResult.rows[0].jumlah >= usage.limits.cashiers) { 
+            return res.status(403).json({ 
+                code: "PLAN_LIMIT_REACHED",
+                pesan: `Paket ${usage.plan} sudah mencapai batas ${usage.limits.cashiers} kasir aktif. Tingkatkan paket untuk menambahkan kasir.`,
             });
         }
 
