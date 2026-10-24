@@ -1,6 +1,7 @@
 const pool = require("../config/database");
 
 const { getPlanUsage } = require("../utils/planLimits");
+const { recordStockMovement } = require("../utils/stockMovements");
 
 // Semua operasi produk memakai ID owner,
 // termasuk ketika pengguna yang login adalah kasir.
@@ -17,6 +18,74 @@ async function resolveOwnerId(userId) {
   const user = result.rows[0];
   return user.role === "owner" ? user.id : user.owner_id;
 }
+
+// RIWAYAT PERGERAKAN STOK
+const getStockMovements = async (req, res) => {
+  try {
+    const ownerId = await resolveOwnerId(req.user.id);
+
+    if (!ownerId) {
+      return res.status(403).json({
+        pesan: "User belum memiliki owner."
+      });
+    }
+
+    const limitInput = Number.parseInt(req.query.limit, 10);
+    const limit = Number.isInteger(limitInput)
+      ? Math.min(Math.max(limitInput, 1), 100)
+      : 50;
+
+    const productId = req.query.productId
+      ? Number.parseInt(req.query.productId, 10)
+      : null;
+
+    if (
+      req.query.productId &&
+      (!Number.isInteger(productId) || productId <= 0)
+    ) {
+      return res.status(400).json({
+        pesan: "ID produk tidak valid."
+      });
+    }
+
+    const result = await pool.query(
+      `SELECT
+         sm.id,
+         sm.product_id,
+         p.nama AS nama_produk,
+         sm.user_id,
+         sm.movement_type,
+         sm.quantity,
+         sm.stock_before,
+         sm.stock_after,
+         sm.source_type,
+         sm.source_id,
+         sm.note,
+         sm.created_at
+       FROM stock_movements sm
+       LEFT JOIN products p
+         ON p.id = sm.product_id
+        AND p.user_id = sm.owner_id
+       WHERE sm.owner_id = $1
+         AND ($2::BIGINT IS NULL OR sm.product_id = $2)
+       ORDER BY sm.created_at DESC, sm.id DESC
+       LIMIT $3`,
+      [ownerId, productId, limit]
+    );
+
+    return res.status(200).json({
+      pesan: "Riwayat pergerakan stok berhasil ditemukan.",
+      data: result.rows
+    });
+
+  } catch (error) {
+    console.error("ERROR RIWAYAT STOK:",error);
+
+    return res.status(500).json({
+      pesan:"Gagal mengambil riwayat pergerakan stok."
+    });
+  }
+};
 
 // =====================================================
 // GET SEMUA PRODUK
@@ -194,8 +263,8 @@ const createProduct = async (req, res) => {
 
     const usage = await getPlanUsage(pool, userId);
 
-    if (usage.productCount >= usage.limits.products) { 
-      return res.status(403).json({ 
+    if (usage.productCount >= usage.limits.products) {
+      return res.status(403).json({
         code: "PLAN_LIMIT_REACHED",
         pesan: `Paket ${usage.plan} sudah mencapai batas produk. Hapus atau nonaktifkan produk yang tidak digunakan, atau tingkatkan paket.`,
       });
@@ -296,35 +365,81 @@ const createProduct = async (req, res) => {
       });
     }
 
-    const result = await pool.query(
-      `INSERT INTO products
-       (
-         nama,
-         qty,
-         harga,
-         harga_modal,
-         id_kategori,
-         gambar,
-         user_id
-       )
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING *`,
-      [
-        nama,
-        qty,
-        harga,
-        hargaModalNumber,
-        id_kategori,
-        gambar,
-        userId
-      ]
-    );
+    let client;
+    let transactionStarted = false;
 
-    return res.status(201).json({
-      pesan: "Produk berhasil ditambahkan",
-      data: result.rows[0]
-    });
-  } catch (error) {
+    try {
+      client = await pool.connect();
+      await client.query("BEGIN");
+      transactionStarted = true;
+
+      const result = await client.query(
+        `INSERT INTO products
+        (
+          nama,
+          qty,
+          harga,
+          harga_modal,
+          id_kategori,
+          gambar,
+          user_id
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING *`,
+        [
+          nama,
+          qty,
+          harga,
+          hargaModalNumber,
+          id_kategori,
+          gambar,
+          userId
+        ]
+      );
+
+      const product = result.rows[0];
+
+      await recordStockMovement(client, {
+        ownerId: userId,
+        productId: product.id,
+        userId: req.user.id,
+        type: "stock_in",
+        quantity: Number(product.qty),
+        stockBefore: 0,
+        stockAfter: Number(product.qty),
+        sourceType: "product_created",
+        sourceId: String(product.id),
+        note: "Stok awal produk baru"
+      });
+
+      await client.query("COMMIT");
+      transactionStarted = false;
+
+      return res.status(201).json({
+        pesan: "Produk berhasil ditambahkan",
+        data: product
+      });
+    } catch (error) {
+      if (client && transactionStarted) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackError) {
+          console.error("ERROR ROLLBACK CREATE PRODUCT:", rollbackError);
+        }
+      }
+
+      console.error("ERROR CREATE PRODUCT:", error);
+
+      return res.status(500).json({
+        pesan: "Terjadi kesalahan pada server"
+      });
+    } finally {
+      if (client) {
+        client.release();
+      }
+    }
+
+    } catch (error) {
     console.error("ERROR CREATE PRODUCT:", error);
 
     return res.status(500).json({
@@ -354,10 +469,10 @@ const importProducts = async (req, res) => {
     const usage = await getPlanUsage(pool, userId);
     const jumlahProdukBaru = Array.isArray(req.body.products)
       ? req.body.products.length
-      : 0; 
+      : 0;
 
-    if (usage.productCount + jumlahProdukBaru > usage.limits.products) { 
-      return res.status(403).json({ 
+    if (usage.productCount + jumlahProdukBaru > usage.limits.products) {
+      return res.status(403).json({
         code: "PLAN_LIMIT_REACHED",
         pesan: `Impor dibatalkan. Paket ${usage.plan} hanya mengizinkan ${usage.limits.products} produk.`,
       });
@@ -426,18 +541,19 @@ const importProducts = async (req, res) => {
         );
       }
 
-      await client.query(
+     const inserted = await client.query(
         `INSERT INTO products
-         (
-           nama,
-           qty,
-           harga,
-           harga_modal,
-           id_kategori,
-           gambar,
-           user_id
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        (
+          nama,
+          qty,
+          harga,
+          harga_modal,
+          id_kategori,
+          gambar,
+          user_id
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id, qty`,
         [
           nama,
           qty,
@@ -448,6 +564,24 @@ const importProducts = async (req, res) => {
           userId
         ]
       );
+
+      const importedProduct = inserted.rows[0];
+      const importedQty = Number(importedProduct.qty);
+
+      if (importedQty > 0) {
+        await recordStockMovement(client, {
+          ownerId: userId,
+          productId: importedProduct.id,
+          userId: req.user.id,
+          type: "stock_in",
+          quantity: importedQty,
+          stockBefore: 0,
+          stockAfter: importedQty,
+          sourceType: "product_import",
+          sourceId: String(importedProduct.id),
+          note: "Stok awal dari impor produk"
+        });
+      }
     }
 
     await client.query("COMMIT");
@@ -491,11 +625,15 @@ const importProducts = async (req, res) => {
 // UBAH PRODUK
 // =====================================================
 const updateProduct = async (req, res) => {
+  let client;
+  let transactionStarted = false;
+
   try {
     const id = req.params.id;
-    const userId = await resolveOwnerId(req.user.id);
+    const actorId = req.user.id;
+    const ownerId = await resolveOwnerId(actorId);
 
-    if (!userId) {
+    if (!ownerId) {
       return res.status(403).json({
         pesan: "User belum memiliki owner."
       });
@@ -517,17 +655,6 @@ const updateProduct = async (req, res) => {
         pesan: "ID harus berupa angka"
       });
     }
-
-    console.log("MASUK UPDATE PRODUK");
-    console.log("ID:", id);
-    console.log(
-      "DATA:",
-      nama,
-      qty,
-      harga_modal,
-      id_kategori
-    );
-    console.log("FILE:", req.file);
 
     if (
       !nama ||
@@ -560,9 +687,9 @@ const updateProduct = async (req, res) => {
     }
 
     if (
-      isNaN(qtyNumber) ||
-      isNaN(hargaModalNumber) ||
-      isNaN(idKategoriNumber)
+      !Number.isFinite(qtyNumber) ||
+      !Number.isFinite(hargaModalNumber) ||
+      !Number.isFinite(idKategoriNumber)
     ) {
       return res.status(400).json({
         pesan:
@@ -581,27 +708,57 @@ const updateProduct = async (req, res) => {
       });
     }
 
-    // Kategori harus milik owner yang sama.
-    const kategoriResult = await pool.query(
+    const gambar = req.file
+      ? `/produk/${req.file.filename}`
+      : null;
+
+    client = await pool.connect();
+
+    await client.query("BEGIN");
+    transactionStarted = true;
+
+    // Pastikan kategori dimiliki owner yang sama.
+    const kategoriResult = await client.query(
       `SELECT id
        FROM kategori
        WHERE id = $1
          AND user_id = $2`,
-      [idKategoriNumber, userId]
+      [idKategoriNumber, ownerId]
     );
 
     if (kategoriResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+
       return res.status(403).json({
         pesan:
           "Kategori tidak ditemukan atau bukan milik user ini"
       });
     }
 
-    const gambar = req.file
-      ? `/produk/${req.file.filename}`
-      : null;
+    // Kunci produk agar perubahan stok tidak saling menimpa.
+    const produkLamaResult = await client.query(
+      `SELECT id, qty
+       FROM products
+       WHERE id = $1
+         AND user_id = $2
+       FOR UPDATE`,
+      [id, ownerId]
+    );
 
-    const result = await pool.query(
+    if (produkLamaResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+
+      return res.status(404).json({
+        pesan: "Produk tidak ditemukan"
+      });
+    }
+
+    const produkLama = produkLamaResult.rows[0];
+    const stokSebelum = Number(produkLama.qty);
+
+    const result = await client.query(
       `UPDATE products
        SET
          nama = $1,
@@ -619,26 +776,49 @@ const updateProduct = async (req, res) => {
         idKategoriNumber,
         gambar,
         id,
-        userId
+        ownerId
       ]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        pesan: "Produk tidak ditemukan"
+    const selisihStok = qtyNumber - stokSebelum;
+
+    // Catat riwayat hanya jika jumlah stok berubah.
+    if (selisihStok !== 0) {
+      await recordStockMovement(client, {
+        ownerId,
+        productId: id,
+        userId: actorId,
+        type: selisihStok > 0 ? "stock_in" : "stock_out",
+        quantity: Math.abs(selisihStok),
+        stockBefore: stokSebelum,
+        stockAfter: qtyNumber,
+        sourceType: "product_update",
+        sourceId: id,
+        note: "Penyesuaian stok dari edit produk"
       });
     }
+
+    await client.query("COMMIT");
+    transactionStarted = false;
 
     return res.json({
       pesan: "Produk berhasil diubah",
       data: result.rows[0]
     });
   } catch (error) {
+    if (client && transactionStarted) {
+      await client.query("ROLLBACK").catch(() => {});
+    }
+
     console.error("ERROR UPDATE PRODUCT:", error);
 
     return res.status(500).json({
       pesan: "Terjadi kesalahan pada server"
     });
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 };
 
@@ -646,56 +826,102 @@ const updateProduct = async (req, res) => {
 // TAMBAH STOK
 // =====================================================
 const tambahStok = async (req, res) => {
+  let client;
+  let transactionStarted = false;
+
   try {
     const id = req.params.id;
-    const userId = await resolveOwnerId(req.user.id);
+    const ownerId = await resolveOwnerId(req.user.id);
 
-    if (!userId) {
+    if (!ownerId) {
       return res.status(403).json({
         pesan: "User belum memiliki owner."
       });
     }
 
-    const { jumlah } = req.body;
+    const jumlah = Number(req.body.jumlah);
 
-    if (!jumlah || jumlah <= 0) {
+    if (!Number.isFinite(jumlah) || jumlah <= 0) {
       return res.status(400).json({
         pesan: "Jumlah stok harus lebih dari 0"
       });
     }
 
-    const result = await pool.query(
+    client = await pool.connect();
+
+    await client.query("BEGIN");
+    transactionStarted = true;
+
+    const result = await client.query(
       `UPDATE products
        SET qty = qty + $1
        WHERE id = $2
          AND user_id = $3
        RETURNING *`,
-      [jumlah, id, userId]
+      [jumlah, id, ownerId]
     );
 
     if (result.rows.length === 0) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+
       return res.status(404).json({
         pesan: "Produk tidak ditemukan"
       });
     }
 
+    const product = result.rows[0];
+    const stockAfter = Number(product.qty);
+    const stockBefore = stockAfter - jumlah;
+
+    await recordStockMovement(client, {
+      ownerId,
+      productId: product.id,
+      userId: req.user.id,
+      type: "stock_in",
+      quantity: jumlah,
+      stockBefore,
+      stockAfter,
+      sourceType: "manual",
+      sourceId: String(product.id),
+      note: "Penambahan stok manual"
+    });
+
+    await client.query("COMMIT");
+    transactionStarted = false;
+
     return res.status(200).json({
       pesan: "Produk berhasil ditambahkan",
-      data: result.rows[0]
+      data: product
     });
   } catch (error) {
+    if (client && transactionStarted) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error(
+          "ERROR ROLLBACK TAMBAH STOK:",
+          rollbackError
+        );
+      }
+    }
+
     console.error("ERROR TAMBAH STOK:", error);
 
     return res.status(500).json({
       pesan: "Gagal menambahkan stok"
     });
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 };
-
 // =====================================================
 // EXPORT
 // =====================================================
 module.exports = {
+  getStockMovements,
   getProducts,
   getProductById,
   deleteProduct,

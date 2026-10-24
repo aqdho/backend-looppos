@@ -3,6 +3,7 @@ const express = require("express");
 const router = express.Router();
 
 const {
+    getStockMovements,
     getProducts,
     getProductById,
     deleteProduct,
@@ -19,6 +20,12 @@ const {
    const upload = require("../middleware/uploadMiddleware");
 
 router.get("/", authMiddleware, getProducts);
+
+router.get(
+    "/stock-movements",
+    authMiddleware,
+    getStockMovements
+);
 
 router.get("/:id", authMiddleware, validateId, getProductById);
 
