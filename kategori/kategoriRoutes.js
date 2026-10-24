@@ -5,20 +5,28 @@ const pool = require("../config/database");
 const authMiddleware = require("../middleware/authMiddleware");
 const ownerMiddleware = require("../middleware/roleMiddleware");
 
-router.get(
+router.get( 
     "/",
     authMiddleware,
     ownerMiddleware,
-    async (req, res) => {
-        const result = await pool.query(
-            "SELECT * FROM kategori WHERE user_id = $1 ORDER BY id",
-            [req.user.id]
-        );
+    async ( req, res) => { 
+        try { 
+            const result = await pool.query( 
+                "SELECT * FROM kategori WHERE user_id = $1 ORDER BY id",
+                [req.user.id] 
+            );
 
-        res.json({
-            pesan: "Data kategori berhasil ditemukan",
-            data: result.rows
-        });
+            res.json({ 
+                pesan: "Data kategori berhasil ditemukan",
+                data: result.rows,
+            });
+        } catch (error) { 
+            console.error("ERROR GET KATEGORI:", error.message);
+
+            res.status(500).json({ 
+                pesan: "Gagal mengambil data kategori",
+            });
+        }
     }
 );
 
