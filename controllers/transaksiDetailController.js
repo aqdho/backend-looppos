@@ -1,5 +1,5 @@
 const pool = require("../config/database");
-
+const { recordStockMovement } = require("../utils/stockMovements");
 
 // =========================
 // HELPER OWNER ID
@@ -24,7 +24,6 @@ const getOwnerId = async (userId) => {
         : user.owner_id;
 };
 
-
 // =========================
 // HELPER ANGKA
 // =========================
@@ -32,11 +31,8 @@ const getOwnerId = async (userId) => {
 const toNumber = (value) => {
     const number = Number(value);
 
-    return Number.isFinite(number)
-        ? number
-        : 0;
+    return Number.isFinite(number) ? number : 0;
 };
-
 
 // =========================
 // POST /transaksi-detail
@@ -44,15 +40,10 @@ const toNumber = (value) => {
 
 const createTransaksiDetail = async (req, res) => {
     const client = await pool.connect();
+    let transactionStarted = false;
 
     try {
-        const {
-            transaksi_id,
-            produk_id,
-            qty,
-            harga
-        } = req.body;
-
+        const { transaksi_id, produk_id, qty, harga } = req.body;
         const ownerId = await getOwnerId(req.user.id);
 
         if (!ownerId) {
@@ -61,18 +52,16 @@ const createTransaksiDetail = async (req, res) => {
             });
         }
 
-        console.log("BODY MASUK:", req.body);
-
         if (
             !transaksi_id ||
             !produk_id ||
-            !qty ||
+            qty === undefined ||
+            qty === null ||
             harga === undefined ||
             harga === null
         ) {
             return res.status(400).json({
-                pesan:
-                    "transaksi_id, produk_id, qty, dan harga wajib diisi"
+                pesan: "transaksi_id, produk_id, qty, dan harga wajib diisi"
             });
         }
 
@@ -92,47 +81,40 @@ const createTransaksiDetail = async (req, res) => {
         }
 
         await client.query("BEGIN");
+        transactionStarted = true;
 
-        // =========================
-        // CEK TRANSAKSI
-        // =========================
-
+        // Cek transaksi milik owner
         const cekTransaksi = await client.query(
             `SELECT id
              FROM transaksi
              WHERE id = $1
-             AND user_id = $2
+               AND user_id = $2
              FOR UPDATE`,
             [transaksi_id, ownerId]
         );
 
         if (cekTransaksi.rows.length === 0) {
             await client.query("ROLLBACK");
+            transactionStarted = false;
 
             return res.status(404).json({
                 pesan: "Transaksi tidak ditemukan"
             });
         }
 
-        // =========================
-        // CEK PRODUK + AMBIL HPP
-        // =========================
-
+        // Ambil dan kunci produk
         const cekProduk = await client.query(
-            `SELECT
-                id,
-                nama,
-                qty,
-                harga_modal
+            `SELECT id, nama, qty, harga_modal
              FROM products
              WHERE id = $1
-             AND user_id = $2
+               AND user_id = $2
              FOR UPDATE`,
             [produk_id, ownerId]
         );
 
         if (cekProduk.rows.length === 0) {
             await client.query("ROLLBACK");
+            transactionStarted = false;
 
             return res.status(404).json({
                 pesan: "Produk tidak ditemukan"
@@ -140,52 +122,28 @@ const createTransaksiDetail = async (req, res) => {
         }
 
         const produk = cekProduk.rows[0];
+        const stockBefore = toNumber(produk.qty);
+        const hargaModal = Math.max(0, toNumber(produk.harga_modal));
 
-        const stokProduk = toNumber(produk.qty);
-
-        const hargaModal = Math.max(
-            0,
-            toNumber(produk.harga_modal)
-        );
-
-        // =========================
-        // CEK STOK
-        // =========================
-
-        if (stokProduk < qtyNumber) {
+        if (stockBefore < qtyNumber) {
             await client.query("ROLLBACK");
+            transactionStarted = false;
 
             return res.status(400).json({
                 pesan:
                     `Stok ${produk.nama} tidak mencukupi. ` +
-                    `Stok tersedia: ${stokProduk}`
+                    `Stok tersedia: ${stockBefore}`
             });
         }
 
-        // =========================
-        // HITUNG SUBTOTAL
-        // =========================
+        const subtotal = Math.round(qtyNumber * hargaNumber);
 
-        const subtotal = Math.round(
-            qtyNumber * hargaNumber
-        );
-
-        // =========================
-        // SIMPAN DETAIL + SNAPSHOT HPP
-        // =========================
-
+        // Simpan detail transaksi
         const result = await client.query(
             `INSERT INTO transaksi_detail
-            (
-                transaksi_id,
-                produk_id,
-                qty,
-                harga,
-                harga_modal,
-                subtotal
-            )
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING *`,
+                (transaksi_id, produk_id, qty, harga, harga_modal, subtotal)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING *`,
             [
                 transaksi_id,
                 produk_id,
@@ -196,36 +154,49 @@ const createTransaksiDetail = async (req, res) => {
             ]
         );
 
-        // =========================
-        // KURANGI STOK
-        // =========================
-
-        await client.query(
+        // Kurangi stok terlebih dahulu
+        const updateStok = await client.query(
             `UPDATE products
              SET qty = qty - $1
              WHERE id = $2
-             AND user_id = $3`,
-            [
-                qtyNumber,
-                produk_id,
-                ownerId
-            ]
+               AND user_id = $3
+             RETURNING qty`,
+            [qtyNumber, produk_id, ownerId]
         );
 
+        if (updateStok.rows.length === 0) {
+            throw new Error("Produk tidak ditemukan saat mengurangi stok");
+        }
+
+        const stockAfter = toNumber(updateStok.rows[0].qty);
+
+        // Catat pergerakan stok dalam transaksi yang sama
+        await recordStockMovement(client, {
+            ownerId,
+            productId: produk_id,
+            userId: req.user.id,
+            type: "stock_out",
+            quantity: qtyNumber,
+            stockBefore,
+            stockAfter,
+            sourceType: "transaksi_detail",
+            sourceId: String(result.rows[0].id),
+            note: `Detail penjualan transaksi #${transaksi_id}`
+        });
+
         await client.query("COMMIT");
+        transactionStarted = false;
 
         return res.status(201).json({
             pesan: "Detail transaksi berhasil ditambahkan",
             data: result.rows[0]
         });
-
     } catch (error) {
-        await client.query("ROLLBACK");
+        if (transactionStarted) {
+            await client.query("ROLLBACK").catch(() => {});
+        }
 
-        console.error(
-            "ERROR CREATE TRANSAKSI DETAIL:",
-            error
-        );
+        console.error("ERROR CREATE TRANSAKSI DETAIL:", error);
 
         return res.status(500).json({
             pesan: "Gagal menambahkan detail transaksi"
@@ -234,7 +205,6 @@ const createTransaksiDetail = async (req, res) => {
         client.release();
     }
 };
-
 
 // =========================
 // GET /transaksi-detail
@@ -260,8 +230,7 @@ const getTransaksiDetail = async (req, res) => {
                 td.harga_modal,
                 td.subtotal
              FROM transaksi_detail td
-             JOIN transaksi t
-                 ON td.transaksi_id = t.id
+             JOIN transaksi t ON td.transaksi_id = t.id
              WHERE t.user_id = $1
              ORDER BY td.id ASC`,
             [ownerId]
@@ -271,19 +240,14 @@ const getTransaksiDetail = async (req, res) => {
             pesan: "Data detail transaksi berhasil ditemukan",
             data: result.rows
         });
-
     } catch (error) {
-        console.error(
-            "ERROR GET TRANSAKSI DETAIL:",
-            error
-        );
+        console.error("ERROR GET TRANSAKSI DETAIL:", error);
 
         return res.status(500).json({
             pesan: "Gagal mengambil data detail transaksi"
         });
     }
 };
-
 
 // =========================
 // GET /transaksi-detail/:id
@@ -292,7 +256,6 @@ const getTransaksiDetail = async (req, res) => {
 const getTransaksiDetailById = async (req, res) => {
     try {
         const id = req.params.id;
-
         const ownerId = await getOwnerId(req.user.id);
 
         if (!ownerId) {
@@ -311,10 +274,9 @@ const getTransaksiDetailById = async (req, res) => {
                 td.harga_modal,
                 td.subtotal
              FROM transaksi_detail td
-             JOIN transaksi t
-                 ON td.transaksi_id = t.id
+             JOIN transaksi t ON td.transaksi_id = t.id
              WHERE td.id = $1
-             AND t.user_id = $2`,
+               AND t.user_id = $2`,
             [id, ownerId]
         );
 
@@ -328,12 +290,8 @@ const getTransaksiDetailById = async (req, res) => {
             pesan: "Detail transaksi berhasil ditemukan",
             data: result.rows[0]
         });
-
     } catch (error) {
-        console.error(
-            "ERROR GET TRANSAKSI DETAIL BY ID:",
-            error
-        );
+        console.error("ERROR GET TRANSAKSI DETAIL BY ID:", error);
 
         return res.status(500).json({
             pesan: "Gagal mengambil detail transaksi"
@@ -341,18 +299,14 @@ const getTransaksiDetailById = async (req, res) => {
     }
 };
 
-
 // =========================
 // GET /transaksi-detail/transaksi/:transaksiId
 // =========================
 
 const getDetailByTransaksiId = async (req, res) => {
     try {
-        const transaksiId =
-            req.params.transaksiId;
-
-        const ownerId =
-            await getOwnerId(req.user.id);
+        const transaksiId = req.params.transaksiId;
+        const ownerId = await getOwnerId(req.user.id);
 
         if (!ownerId) {
             return res.status(403).json({
@@ -372,36 +326,21 @@ const getDetailByTransaksiId = async (req, res) => {
                 td.harga_modal,
                 td.subtotal
              FROM transaksi_detail td
-             JOIN transaksi
-                 ON td.transaksi_id = transaksi.id
-             JOIN products
-                 ON td.produk_id = products.id
+             JOIN transaksi ON td.transaksi_id = transaksi.id
+             JOIN products ON td.produk_id = products.id
              WHERE td.transaksi_id = $1
-             AND transaksi.user_id = $2
-             AND products.user_id = $2
+               AND transaksi.user_id = $2
+               AND products.user_id = $2
              ORDER BY td.id ASC`,
-            [
-                transaksiId,
-                ownerId
-            ]
-        );
-
-        console.log(
-            "DETAIL DARI DATABASE:",
-            result.rows
+            [transaksiId, ownerId]
         );
 
         return res.status(200).json({
-            pesan:
-                "Detail transaksi berhasil ditemukan",
+            pesan: "Detail transaksi berhasil ditemukan",
             data: result.rows
         });
-
     } catch (error) {
-        console.error(
-            "ERROR GET DETAIL TRANSAKSI:",
-            error
-        );
+        console.error("ERROR GET DETAIL TRANSAKSI:", error);
 
         return res.status(500).json({
             pesan: "Gagal mengambil detail transaksi"
@@ -409,26 +348,18 @@ const getDetailByTransaksiId = async (req, res) => {
     }
 };
 
-
 // =========================
 // PUT /transaksi-detail/:id
 // =========================
 
 const updateTransaksiDetail = async (req, res) => {
     const client = await pool.connect();
+    let transactionStarted = false;
 
     try {
         const id = req.params.id;
-
-        const {
-            transaksi_id,
-            produk_id,
-            qty,
-            harga
-        } = req.body;
-
-        const ownerId =
-            await getOwnerId(req.user.id);
+        const { transaksi_id, produk_id, qty, harga } = req.body;
+        const ownerId = await getOwnerId(req.user.id);
 
         if (!ownerId) {
             return res.status(403).json({
@@ -439,13 +370,13 @@ const updateTransaksiDetail = async (req, res) => {
         if (
             !transaksi_id ||
             !produk_id ||
-            !qty ||
+            qty === undefined ||
+            qty === null ||
             harga === undefined ||
             harga === null
         ) {
             return res.status(400).json({
-                pesan:
-                    "transaksi_id, produk_id, qty, dan harga wajib diisi"
+                pesan: "transaksi_id, produk_id, qty, dan harga wajib diisi"
             });
         }
 
@@ -465,256 +396,100 @@ const updateTransaksiDetail = async (req, res) => {
         }
 
         await client.query("BEGIN");
+        transactionStarted = true;
 
-        // =========================
-        // DETAIL LAMA
-        // =========================
-
-        const detailLama =
-            await client.query(
-                `SELECT td.*
-                 FROM transaksi_detail td
-                 JOIN transaksi t
-                     ON td.transaksi_id = t.id
-                 WHERE td.id = $1
-                 AND t.user_id = $2
-                 FOR UPDATE`,
-                [
-                    id,
-                    ownerId
-                ]
-            );
+        // Ambil dan kunci detail lama
+        const detailLama = await client.query(
+            `SELECT td.*
+             FROM transaksi_detail td
+             JOIN transaksi t ON td.transaksi_id = t.id
+             WHERE td.id = $1
+               AND t.user_id = $2
+             FOR UPDATE OF td`,
+            [id, ownerId]
+        );
 
         if (detailLama.rows.length === 0) {
             await client.query("ROLLBACK");
+            transactionStarted = false;
 
             return res.status(404).json({
-                pesan:
-                    "Detail transaksi tidak ditemukan"
+                pesan: "Detail transaksi tidak ditemukan"
             });
         }
 
-        const dataLama =
-            detailLama.rows[0];
+        const dataLama = detailLama.rows[0];
 
-        // =========================
-        // CEK TRANSAKSI BARU
-        // =========================
-
-        const cekTransaksi =
-            await client.query(
-                `SELECT id
-                 FROM transaksi
-                 WHERE id = $1
-                 AND user_id = $2
-                 FOR UPDATE`,
-                [
-                    transaksi_id,
-                    ownerId
-                ]
-            );
+        // Pastikan transaksi tujuan milik owner
+        const cekTransaksi = await client.query(
+            `SELECT id
+             FROM transaksi
+             WHERE id = $1
+               AND user_id = $2
+             FOR UPDATE`,
+            [transaksi_id, ownerId]
+        );
 
         if (cekTransaksi.rows.length === 0) {
             await client.query("ROLLBACK");
+            transactionStarted = false;
 
             return res.status(404).json({
-                pesan:
-                    "Transaksi tidak ditemukan"
+                pesan: "Transaksi tidak ditemukan"
             });
         }
 
-        // =========================
-        // CEK PRODUK BARU + HPP
-        // =========================
-
-        const cekProdukBaru =
-            await client.query(
-                `SELECT
-                    id,
-                    nama,
-                    qty,
-                    harga_modal
-                 FROM products
-                 WHERE id = $1
-                 AND user_id = $2
-                 FOR UPDATE`,
-                [
-                    produk_id,
-                    ownerId
-                ]
-            );
+        // Ambil dan kunci produk tujuan
+        const cekProdukBaru = await client.query(
+            `SELECT id, nama, qty, harga_modal
+             FROM products
+             WHERE id = $1
+               AND user_id = $2
+             FOR UPDATE`,
+            [produk_id, ownerId]
+        );
 
         if (cekProdukBaru.rows.length === 0) {
             await client.query("ROLLBACK");
+            transactionStarted = false;
 
             return res.status(404).json({
-                pesan:
-                    "Produk tidak ditemukan"
+                pesan: "Produk tidak ditemukan"
             });
         }
 
-        const produkBaru =
-            cekProdukBaru.rows[0];
-
-        const stokProdukBaru =
-            toNumber(produkBaru.qty);
-
-        const hargaModalBaru =
-            Math.max(
-                0,
-                toNumber(
-                    produkBaru.harga_modal
-                )
-            );
+        const produkBaru = cekProdukBaru.rows[0];
+        const hargaModalBaru = Math.max(
+            0,
+            toNumber(produkBaru.harga_modal)
+        );
 
         const produkBerubah =
-            Number(dataLama.produk_id) !==
-            Number(produk_id);
+            Number(dataLama.produk_id) !== Number(produk_id);
 
-        // =========================
+        const subtotal = Math.round(qtyNumber * hargaNumber);
+
+        // ---------------------------------
         // PRODUK TIDAK BERUBAH
-        // =========================
+        // ---------------------------------
 
         if (!produkBerubah) {
-            const selisihQty =
-                qtyNumber -
-                toNumber(dataLama.qty);
+            const selisihQty = qtyNumber - toNumber(dataLama.qty);
 
-            if (
-                selisihQty > 0 &&
-                stokProdukBaru < selisihQty
-            ) {
+            const stokSaatIni = toNumber(produkBaru.qty);
+
+            if (selisihQty > 0 && stokSaatIni < selisihQty) {
                 await client.query("ROLLBACK");
+                transactionStarted = false;
 
                 return res.status(400).json({
                     pesan:
                         `Stok ${produkBaru.nama} tidak mencukupi. ` +
-                        `Stok tersedia: ${stokProdukBaru}`
+                        `Stok tersedia: ${stokSaatIni}`
                 });
             }
 
-            const subtotal =
-                Math.round(
-                    qtyNumber *
-                    hargaNumber
-                );
-
-            const result =
-                await client.query(
-                    `UPDATE transaksi_detail
-                     SET transaksi_id = $1,
-                         produk_id = $2,
-                         qty = $3,
-                         harga = $4,
-                         harga_modal = $5,
-                         subtotal = $6
-                     WHERE id = $7
-                     RETURNING *`,
-                    [
-                        transaksi_id,
-                        produk_id,
-                        qtyNumber,
-                        hargaNumber,
-                        hargaModalBaru,
-                        subtotal,
-                        id
-                    ]
-                );
-
-            // Sesuaikan stok
-            if (selisihQty !== 0) {
-                await client.query(
-                    `UPDATE products
-                     SET qty = qty - $1
-                     WHERE id = $2
-                     AND user_id = $3`,
-                    [
-                        selisihQty,
-                        produk_id,
-                        ownerId
-                    ]
-                );
-            }
-
-            await client.query("COMMIT");
-
-            return res.status(200).json({
-                pesan:
-                    "Detail transaksi berhasil diubah",
-                data: result.rows[0]
-            });
-        }
-
-        // =========================
-        // PRODUK BERUBAH
-        // =========================
-
-        // Kembalikan stok produk lama
-        await client.query(
-            `UPDATE products
-             SET qty = qty + $1
-             WHERE id = $2
-             AND user_id = $3`,
-            [
-                dataLama.qty,
-                dataLama.produk_id,
-                ownerId
-            ]
-        );
-
-        // Setelah stok lama dikembalikan,
-        // cek stok produk baru
-        const stokProdukBaruSetelahPengembalian =
-            toNumber(
-                (
-                    await client.query(
-                        `SELECT qty
-                         FROM products
-                         WHERE id = $1
-                         AND user_id = $2
-                         FOR UPDATE`,
-                        [
-                            produk_id,
-                            ownerId
-                        ]
-                    )
-                ).rows[0]?.qty
-            );
-
-        if (
-            stokProdukBaruSetelahPengembalian <
-            qtyNumber
-        ) {
-            await client.query("ROLLBACK");
-
-            return res.status(400).json({
-                pesan:
-                    `Stok ${produkBaru.nama} tidak mencukupi. ` +
-                    `Stok tersedia: ${stokProdukBaruSetelahPengembalian}`
-            });
-        }
-
-        // Kurangi stok produk baru
-        await client.query(
-            `UPDATE products
-             SET qty = qty - $1
-             WHERE id = $2
-             AND user_id = $3`,
-            [
-                qtyNumber,
-                produk_id,
-                ownerId
-            ]
-        );
-
-        const subtotal =
-            Math.round(
-                qtyNumber *
-                hargaNumber
-            );
-
-        const result =
-            await client.query(
+            const result = await client.query(
                 `UPDATE transaksi_detail
                  SET transaksi_id = $1,
                      produk_id = $2,
@@ -735,31 +510,183 @@ const updateTransaksiDetail = async (req, res) => {
                 ]
             );
 
-        await client.query("COMMIT");
+            // Hanya catat pergerakan jika qty benar-benar berubah
+            if (selisihQty !== 0) {
+                const updateStok = await client.query(
+                    `UPDATE products
+                     SET qty = qty - $1
+                     WHERE id = $2
+                       AND user_id = $3
+                     RETURNING qty`,
+                    [selisihQty, produk_id, ownerId]
+                );
 
-        return res.status(200).json({
-            pesan:
-                "Detail transaksi berhasil diubah",
-            data: result.rows[0]
-        });
+                if (updateStok.rows.length === 0) {
+                    throw new Error(
+                        "Produk tidak ditemukan saat menyesuaikan stok"
+                    );
+                }
 
-    } catch (error) {
-        await client.query("ROLLBACK");
+                const stockAfter = toNumber(updateStok.rows[0].qty);
+                const stockBefore = stockAfter + selisihQty;
 
-        console.error(
-            "ERROR UPDATE TRANSAKSI DETAIL:",
-            error
+                await recordStockMovement(client, {
+                    ownerId,
+                    productId: produk_id,
+                    userId: req.user.id,
+                    type: selisihQty > 0 ? "stock_out" : "stock_in",
+                    quantity: Math.abs(selisihQty),
+                    stockBefore,
+                    stockAfter,
+                    sourceType: "transaksi_detail",
+                    sourceId: String(id),
+                    note: `Penyesuaian detail transaksi #${transaksi_id}`
+                });
+            }
+
+            await client.query("COMMIT");
+            transactionStarted = false;
+
+            return res.status(200).json({
+                pesan: "Detail transaksi berhasil diubah",
+                data: result.rows[0]
+            });
+        }
+
+        // ---------------------------------
+        // PRODUK BERUBAH: KEMBALIKAN STOK LAMA
+        // ---------------------------------
+
+        const qtyLama = toNumber(dataLama.qty);
+
+        const kembalikanStok = await client.query(
+            `UPDATE products
+             SET qty = qty + $1
+             WHERE id = $2
+               AND user_id = $3
+             RETURNING qty`,
+            [qtyLama, dataLama.produk_id, ownerId]
         );
 
+        if (kembalikanStok.rows.length === 0) {
+            throw new Error("Produk lama tidak ditemukan saat mengembalikan stok");
+        }
+
+        const oldStockAfter = toNumber(kembalikanStok.rows[0].qty);
+        const oldStockBefore = oldStockAfter - qtyLama;
+
+        await recordStockMovement(client, {
+            ownerId,
+            productId: dataLama.produk_id,
+            userId: req.user.id,
+            type: "stock_in",
+            quantity: qtyLama,
+            stockBefore: oldStockBefore,
+            stockAfter: oldStockAfter,
+            sourceType: "transaksi_detail",
+            sourceId: String(id),
+            note: `Pengembalian stok dari perubahan detail transaksi #${transaksi_id}`
+        });
+
+        // Cek stok produk baru setelah stok lama dikembalikan
+        const cekStokBaru = await client.query(
+            `SELECT qty
+             FROM products
+             WHERE id = $1
+               AND user_id = $2
+             FOR UPDATE`,
+            [produk_id, ownerId]
+        );
+
+        if (cekStokBaru.rows.length === 0) {
+            throw new Error("Produk baru tidak ditemukan saat mengecek stok");
+        }
+
+        const stokProdukBaru = toNumber(cekStokBaru.rows[0].qty);
+
+        if (stokProdukBaru < qtyNumber) {
+            await client.query("ROLLBACK");
+            transactionStarted = false;
+
+            return res.status(400).json({
+                pesan:
+                    `Stok ${produkBaru.nama} tidak mencukupi. ` +
+                    `Stok tersedia: ${stokProdukBaru}`
+            });
+        }
+
+        // Kurangi stok produk baru
+        const kurangiStokBaru = await client.query(
+            `UPDATE products
+             SET qty = qty - $1
+             WHERE id = $2
+               AND user_id = $3
+             RETURNING qty`,
+            [qtyNumber, produk_id, ownerId]
+        );
+
+        if (kurangiStokBaru.rows.length === 0) {
+            throw new Error("Produk baru tidak ditemukan saat mengurangi stok");
+        }
+
+        const newStockAfter = toNumber(kurangiStokBaru.rows[0].qty);
+        const newStockBefore = newStockAfter + qtyNumber;
+
+        await recordStockMovement(client, {
+            ownerId,
+            productId: produk_id,
+            userId: req.user.id,
+            type: "stock_out",
+            quantity: qtyNumber,
+            stockBefore: newStockBefore,
+            stockAfter: newStockAfter,
+            sourceType: "transaksi_detail",
+            sourceId: String(id),
+            note: `Penjualan produk pengganti pada transaksi #${transaksi_id}`
+        });
+
+        const result = await client.query(
+            `UPDATE transaksi_detail
+             SET transaksi_id = $1,
+                 produk_id = $2,
+                 qty = $3,
+                 harga = $4,
+                 harga_modal = $5,
+                 subtotal = $6
+             WHERE id = $7
+             RETURNING *`,
+            [
+                transaksi_id,
+                produk_id,
+                qtyNumber,
+                hargaNumber,
+                hargaModalBaru,
+                subtotal,
+                id
+            ]
+        );
+
+        await client.query("COMMIT");
+        transactionStarted = false;
+
+        return res.status(200).json({
+            pesan: "Detail transaksi berhasil diubah",
+            data: result.rows[0]
+        });
+    } catch (error) {
+        if (transactionStarted) {
+            await client.query("ROLLBACK").catch(() => {});
+        }
+
+        console.error("ERROR UPDATE TRANSAKSI DETAIL:", error);
+
         return res.status(500).json({
-            pesan:
-                "Gagal mengubah detail transaksi"
+            pesan: "Gagal mengubah detail transaksi"
         });
     } finally {
         client.release();
     }
 };
-
 
 // =========================
 // DELETE /transaksi-detail/:id
@@ -767,106 +694,108 @@ const updateTransaksiDetail = async (req, res) => {
 
 const deleteTransaksiDetail = async (req, res) => {
     const client = await pool.connect();
+    let transactionStarted = false;
 
     try {
         const id = req.params.id;
-
-        const ownerId =
-            await getOwnerId(req.user.id);
+        const ownerId = await getOwnerId(req.user.id);
 
         if (!ownerId) {
             return res.status(403).json({
-                pesan:
-                    "User belum memiliki owner"
+                pesan: "User belum memiliki owner"
             });
         }
 
         await client.query("BEGIN");
+        transactionStarted = true;
 
-        // =========================
-        // CEK DETAIL
-        // =========================
-
-        const detail =
-            await client.query(
-                `SELECT td.*
-                 FROM transaksi_detail td
-                 JOIN transaksi t
-                     ON td.transaksi_id = t.id
-                 WHERE td.id = $1
-                 AND t.user_id = $2
-                 FOR UPDATE`,
-                [
-                    id,
-                    ownerId
-                ]
-            );
+        // Ambil dan kunci detail transaksi
+        const detail = await client.query(
+            `SELECT td.*
+             FROM transaksi_detail td
+             JOIN transaksi t ON td.transaksi_id = t.id
+             WHERE td.id = $1
+               AND t.user_id = $2
+             FOR UPDATE OF td`,
+            [id, ownerId]
+        );
 
         if (detail.rows.length === 0) {
             await client.query("ROLLBACK");
+            transactionStarted = false;
 
             return res.status(404).json({
-                pesan:
-                    "Detail transaksi tidak ditemukan"
+                pesan: "Detail transaksi tidak ditemukan"
             });
         }
 
-        const dataDetail =
-            detail.rows[0];
+        const dataDetail = detail.rows[0];
+        const qtyDikembalikan = toNumber(dataDetail.qty);
 
-        // =========================
-        // KEMBALIKAN STOK
-        // =========================
-
-        await client.query(
+        // Kembalikan stok dan ambil jumlah stok aktual
+        const updateStok = await client.query(
             `UPDATE products
              SET qty = qty + $1
              WHERE id = $2
-             AND user_id = $3`,
+               AND user_id = $3
+             RETURNING qty`,
             [
-                dataDetail.qty,
+                qtyDikembalikan,
                 dataDetail.produk_id,
                 ownerId
             ]
         );
 
-        // =========================
-        // HAPUS DETAIL
-        // =========================
+        if (updateStok.rows.length === 0) {
+            throw new Error("Produk tidak ditemukan saat mengembalikan stok");
+        }
 
-        const result =
-            await client.query(
-                `DELETE FROM transaksi_detail
-                 WHERE id = $1
-                 RETURNING *`,
-                [id]
-            );
+        const stockAfter = toNumber(updateStok.rows[0].qty);
+        const stockBefore = stockAfter - qtyDikembalikan;
 
-        await client.query("COMMIT");
-
-        return res.status(200).json({
-            pesan:
-                "Detail transaksi berhasil dihapus dan stok dikembalikan",
-            data: result.rows[0]
+        // Catat pengembalian stok
+        await recordStockMovement(client, {
+            ownerId,
+            productId: dataDetail.produk_id,
+            userId: req.user.id,
+            type: "stock_in",
+            quantity: qtyDikembalikan,
+            stockBefore,
+            stockAfter,
+            sourceType: "transaksi_detail",
+            sourceId: String(id),
+            note: `Stok dikembalikan setelah detail transaksi #${id} dihapus`
         });
 
-    } catch (error) {
-        await client.query("ROLLBACK");
-
-        console.error(
-            "ERROR DELETE TRANSAKSI DETAIL:",
-            error
+        // Hapus detail setelah stok dan riwayat berhasil diproses
+        const result = await client.query(
+            `DELETE FROM transaksi_detail
+             WHERE id = $1
+             RETURNING *`,
+            [id]
         );
 
+        await client.query("COMMIT");
+        transactionStarted = false;
+
+        return res.status(200).json({
+            pesan: "Detail transaksi berhasil dihapus dan stok dikembalikan",
+            data: result.rows[0]
+        });
+    } catch (error) {
+        if (transactionStarted) {
+            await client.query("ROLLBACK").catch(() => {});
+        }
+
+        console.error("ERROR DELETE TRANSAKSI DETAIL:", error);
+
         return res.status(500).json({
-            pesan:
-                "Gagal menghapus detail transaksi"
+            pesan: "Gagal menghapus detail transaksi"
         });
     } finally {
         client.release();
     }
 };
-
 
 // =========================
 // EXPORT

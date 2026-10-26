@@ -1,4 +1,5 @@
 const pool = require("../config/database");
+const { recordStockMovement } = require("../utils/stockMovements");
 
 // Batas kolom PostgreSQL.
 const MAX_NUMERIC_12_2 = 9999999999.99;
@@ -405,6 +406,19 @@ const createPembayaran = async (req, res) => {
                  WHERE id = $2 AND user_id = $3`,
                 [qty, produkId, ownerId]
             );
+
+            await recordStockMovement(client, {
+                ownerId,
+                productId: produkId,
+                userId: req.user.id,
+                type: "stock_out",
+                quantity: qty,
+                stockBefore: Number(produk.qty),
+                stockAfter: Number(produk.qty) - qty,
+                sourceType: "transaksi",
+                sourceId: String(transaksi.id),
+                note: "Penjualan tunai"
+            });
         }
 
         await buatNotifikasiTransaksi(client, {
@@ -890,17 +904,31 @@ const simulateQrisPaid = async (req, res) => {
 
             lockedProducts.push({
                 id: produk.id,
-                qty
+                qty,
+                stockBefore: Number(produk.qty)
             });
         }
 
         for (const item of lockedProducts) {
             await client.query(
                 `UPDATE products
-                 SET qty = qty - $1
-                 WHERE id = $2 AND user_id = $3`,
+                SET qty = qty - $1
+                WHERE id = $2 AND user_id = $3`,
                 [item.qty, item.id, ownerId]
             );
+
+            await recordStockMovement(client, {
+                ownerId,
+                productId: item.id,
+                userId: req.user.id,
+                type: "stock_out",
+                quantity: item.qty,
+                stockBefore: item.stockBefore,
+                stockAfter: item.stockBefore - item.qty,
+                sourceType: "transaksi",
+                sourceId: String(transaksi.id),
+                note: "Penjualan QRIS berhasil"
+            });
         }
 
         await client.query(

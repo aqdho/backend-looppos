@@ -1,4 +1,5 @@
 const pool = require("../config/database");
+const { recordStockMovement } = require("../utils/stockMovements");
 
 // GET PAYMENT ACCOUNT OWNER
 const getPaymentAccount = async (req, res) => {
@@ -381,23 +382,28 @@ const xenditWebhook = async (req, res) => {
             const transaksiResult = await client.query(
                 `
                 SELECT
-                    id,
-                    total,
-                    bayar,
-                    user_id,
-                    payment_status,
-                    payment_method,
-                    payment_id,
-                    payment_reference
-                FROM transaksi
-                WHERE payment_method = 'qris'
-                  AND (
-                      payment_id = $1
-                      OR payment_reference = $2
-                      OR payment_reference = $3
-                  )
+                    t.id,
+                    t.total,
+                    t.bayar,
+                    t.user_id,
+                    t.payment_status,
+                    t.payment_method,
+                    t.payment_id,
+                    t.payment_reference,
+                    CASE
+                        WHEN u.role = 'owner' THEN u.id
+                        ELSE u.owner_id
+                    END AS owner_id
+                FROM transaksi t
+                JOIN users u ON u.id = t.user_id
+                WHERE t.payment_method = 'qris'
+                AND (
+                    t.payment_id = $1
+                    OR t.payment_reference = $2
+                    OR t.payment_reference = $3
+                )
                 LIMIT 1
-                FOR UPDATE
+                FOR UPDATE OF t
                 `,
                 [
                     paymentRequestId || "",
@@ -405,7 +411,6 @@ const xenditWebhook = async (req, res) => {
                     data.reference_id || ""
                 ]
             );
-
             if (transaksiResult.rows.length === 0) {
                 await client.query("ROLLBACK");
 
@@ -515,17 +520,36 @@ const xenditWebhook = async (req, res) => {
             // 9. KURANGI STOK
             // ==========================================
             for (const item of detailResult.rows) {
+                const quantity = Number(item.qty);
+                const stockBefore = Number(item.stok);
+                const stockAfter = stockBefore - quantity;
+
                 await client.query(
                     `
                     UPDATE products
                     SET qty = qty - $1
                     WHERE id = $2
+                    AND user_id = $3
                     `,
                     [
-                        item.qty,
-                        item.produk_id
+                        quantity,
+                        item.produk_id,
+                        transaksi.owner_id
                     ]
                 );
+
+                await recordStockMovement(client, {
+                    ownerId: transaksi.owner_id,
+                    productId: item.produk_id,
+                    userId: transaksi.user_id,
+                    type: "stock_out",
+                    quantity,
+                    stockBefore,
+                    stockAfter,
+                    sourceType: "transaksi",
+                    sourceId: String(transaksi.id),
+                    note: "Pembayaran QRIS Xendit berhasil"
+                });
             }
 
             // ==========================================
