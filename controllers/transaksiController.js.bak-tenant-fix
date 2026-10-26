@@ -1,0 +1,885 @@
+
+const pool = require("../config/database");
+
+// =====================================================
+// CREATE TRANSAKSI LAMA
+// =====================================================
+
+const createTransaksi = async (req, res) => {
+    try {
+        const { tanggal, total } = req.body;
+
+        if (!tanggal || total === undefined) {
+            return res.status(400).json({
+                pesan: "tanggal dan total wajib diisi"
+            });
+        }
+
+        const result = await pool.query(
+            `INSERT INTO transaksi (tanggal, total)
+             VALUES ($1, $2)
+             RETURNING *`,
+            [tanggal, total]
+        );
+
+        return res.status(201).json({
+            pesan: "Transaksi berhasil ditambahkan",
+            data: result.rows[0]
+        });
+    } catch (error) {
+        console.error("ERROR CREATE TRANSAKSI:", error);
+
+        return res.status(500).json({
+            pesan: "Gagal menambah transaksi"
+        });
+    }
+};
+
+// =====================================================
+// PEMBAYARAN TUNAI
+// =====================================================
+
+const createPembayaran = async (req, res) => {
+    const client = await pool.connect();
+    let transactionStarted = false;
+
+    try {
+        const {
+            tanggal,
+            total,
+            bayar,
+            mode_pesanan,
+            items
+        } = req.body;
+
+        const userResult = await client.query(
+            `SELECT id, role, owner_id
+             FROM users
+             WHERE id = $1`,
+            [req.user.id]
+        );
+
+        if (userResult.rows.length === 0) {
+            return res.status(401).json({
+                pesan: "User tidak ditemukan"
+            });
+        }
+
+        const user = userResult.rows[0];
+        const ownerId =
+            user.role === "owner" ? user.id : user.owner_id;
+
+        if (!ownerId) {
+            return res.status(403).json({
+                pesan: "User belum memiliki owner"
+            });
+        }
+
+        if (
+            !tanggal ||
+            total === undefined ||
+            !Array.isArray(items) ||
+            items.length === 0
+        ) {
+            return res.status(400).json({
+                pesan: "Data pembayaran tidak lengkap"
+            });
+        }
+
+        const totalNumber = Number(total);
+        const bayarNumber = Number(bayar);
+
+        if (
+            !Number.isFinite(totalNumber) ||
+            totalNumber < 0
+        ) {
+            return res.status(400).json({
+                pesan: "Total transaksi tidak valid"
+            });
+        }
+
+        if (
+            !Number.isFinite(bayarNumber) ||
+            bayarNumber < totalNumber
+        ) {
+            return res.status(400).json({
+                pesan: "Nominal bayar tidak mencukupi"
+            });
+        }
+
+        await client.query("BEGIN");
+        transactionStarted = true;
+
+        const activeShiftResult = await client.query( 
+            `SELECT id
+            FROM shifts
+            WHERE owner_id = $1
+              AND cashier_id = $2
+              AND status = 'open'
+            FOR UPDATE`,
+            [ownerId, req.user.id]
+        );
+
+        if (activeShiftResult.rows.length === 0) { 
+            await client.query("ROLLBACK");
+            transactionStarted = false;
+
+            return res.status(409).json({ 
+                pesan: "Buka shift kasir terlebih dahulu sebelum menerima pembayaran."
+            });
+        }
+
+        const activeShiftId = activeShiftResult.rows[0].id;
+
+       
+        const transaksiResult = await client.query(
+            `INSERT INTO transaksi (
+                tanggal,
+                total,
+                user_id,
+                shift_id,
+                bayar,
+                payment_status,
+                payment_method,
+                mode_pesanan,
+                subtotal,
+                pajak,
+                service_charge
+            )
+            VALUES ($1, $2, $3, $4, $5, 'paid', 'cash', $6, $2, 0, 0)
+            RETURNING *`,
+            [
+                tanggal,
+                Math.round(totalNumber),
+                ownerId,
+                activeShiftId,
+                bayarNumber,
+                mode_pesanan || "dine_in"
+            ]
+        );
+
+
+        const transaksi = transaksiResult.rows[0];
+
+        for (const item of items) {
+            const produkId = Number(
+                item.produk_id ?? item.id ?? item.product_id
+            );
+            const qty = Number(item.qty);
+            const harga = Number(
+                item.harga ?? item.harga_jual ?? item.price
+            );
+
+            if (
+                !Number.isInteger(produkId) ||
+                produkId <= 0 ||
+                !Number.isInteger(qty) ||
+                qty <= 0 ||
+                !Number.isFinite(harga) ||
+                harga < 0
+            ) {
+                throw new Error("Data item pembayaran tidak valid");
+            }
+
+            const produkResult = await client.query(
+                `SELECT id, nama, qty, harga_modal
+                 FROM products
+                 WHERE id = $1 AND user_id = $2
+                 FOR UPDATE`,
+                [produkId, ownerId]
+            );
+
+            if (produkResult.rows.length === 0) {
+                throw new Error(
+                    `Produk ID ${produkId} tidak ditemukan`
+                );
+            }
+
+            const produk = produkResult.rows[0];
+
+            if (Number(produk.qty) < qty) {
+                throw new Error(
+                    `Stok ${produk.nama} tidak mencukupi. ` +
+                    `Stok tersedia: ${produk.qty}`
+                );
+            }
+
+            const hargaModal = Math.max(
+                0,
+                Number(produk.harga_modal) || 0
+            );
+
+            await client.query(
+                `INSERT INTO transaksi_detail (
+                    transaksi_id,
+                    produk_id,
+                    qty,
+                    harga,
+                    harga_modal,
+                    subtotal
+                )
+                VALUES ($1, $2, $3, $4, $5, $6)`,
+                [
+                    transaksi.id,
+                    produkId,
+                    qty,
+                    Math.round(harga),
+                    hargaModal,
+                    Math.round(qty * harga)
+                ]
+            );
+
+            await client.query(
+                `UPDATE products
+                 SET qty = qty - $1
+                 WHERE id = $2 AND user_id = $3`,
+                [qty, produkId, ownerId]
+            );
+        }
+
+        await client.query("COMMIT");
+        transactionStarted = false;
+
+        return res.status(201).json({
+            pesan: "Pembayaran berhasil",
+            data: transaksi
+        });
+    } catch (error) {
+        if (transactionStarted) {
+            await client.query("ROLLBACK");
+        }
+
+        console.error("ERROR PEMBAYARAN:", error);
+
+        return res.status(400).json({
+            pesan: error.message || "Pembayaran gagal"
+        });
+    } finally {
+        client.release();
+    }
+};
+
+// =====================================================
+// CREATE QRIS — SIMULATOR
+// Status awal pending; stok belum dikurangi
+// =====================================================
+
+
+const createQrisPayment = async (req, res) => {
+    const client = await pool.connect();
+    let transactionStarted = false;
+
+    try {
+        if (process.env.QRIS_SIMULATOR !== "true") {
+            return res.status(503).json({
+                pesan: "QRIS simulator tidak aktif"
+            });
+        }
+
+        const {
+            tanggal,
+            total,
+            mode_pesanan,
+            items
+        } = req.body;
+
+        const userResult = await client.query(
+            `SELECT id, role, owner_id
+             FROM users
+             WHERE id = $1`,
+            [req.user.id]
+        );
+
+        if (userResult.rows.length === 0) {
+            return res.status(401).json({
+                pesan: "User tidak ditemukan"
+            });
+        }
+
+        const user = userResult.rows[0];
+        const ownerId =
+            user.role === "owner" ? user.id : user.owner_id;
+
+        if (!ownerId) {
+            return res.status(403).json({
+                pesan: "User belum memiliki owner"
+            });
+        }
+
+        const totalNumber = Number(total);
+
+        if (
+            !tanggal ||
+            !Number.isFinite(totalNumber) ||
+            totalNumber <= 0 ||
+            !Array.isArray(items) ||
+            items.length === 0
+        ) {
+            return res.status(400).json({
+                pesan: "Data transaksi QRIS tidak valid"
+            });
+        }
+
+        await client.query("BEGIN");
+        transactionStarted = true;
+
+        let subtotal = 0;
+        const detailItems = [];
+
+        for (const item of items) {
+            const produkId = Number(item.produk_id);
+            const qty = Number(item.qty);
+
+            if (
+                !Number.isInteger(produkId) ||
+                produkId <= 0 ||
+                !Number.isInteger(qty) ||
+                qty <= 0
+            ) {
+                throw new Error("Data item QRIS tidak valid");
+            }
+
+            const produkResult = await client.query(
+                `SELECT id, nama, qty, harga, harga_modal
+                 FROM products
+                 WHERE id = $1 AND user_id = $2
+                 FOR UPDATE`,
+                [produkId, ownerId]
+            );
+
+            if (produkResult.rows.length === 0) {
+                throw new Error(
+                    `Produk ID ${produkId} tidak ditemukan`
+                );
+            }
+
+            const produk = produkResult.rows[0];
+
+            if (Number(produk.qty) < qty) {
+                throw new Error(
+                    `Stok ${produk.nama} tidak mencukupi`
+                );
+            }
+
+            const harga = Number(produk.harga);
+
+            if (!Number.isFinite(harga) || harga < 0) {
+                throw new Error(
+                    `Harga produk ${produk.nama} tidak valid`
+                );
+            }
+
+            const hargaModal = Math.max(
+                0,
+                Number(produk.harga_modal) || 0
+            );
+
+            const subtotalItem = Math.round(qty * harga);
+            subtotal += subtotalItem;
+
+            detailItems.push({
+                produkId,
+                qty,
+                harga,
+                hargaModal,
+                subtotalItem
+            });
+        }
+
+        // Ambil pengaturan pajak dan service charge milik owner.
+        const settingsResult = await client.query(
+            `SELECT *
+             FROM settings
+             WHERE user_id = $1
+             LIMIT 1`,
+            [ownerId]
+        );
+
+        const settings = settingsResult.rows[0] || {};
+
+        const pajakAktif =
+            settings.pajak_aktif === true ||
+            settings.pajak_aktif === "true";
+
+        const serviceAktif =
+            settings.service_aktif === true ||
+            settings.service_aktif === "true";
+
+        const pajakPersentase = Number(
+            settings.pajak_persentase
+        ) || 0;
+
+        const servicePersentase = Number(
+            settings.service_persentase
+        ) || 0;
+
+        const pajak = pajakAktif && pajakPersentase > 0
+            ? Math.round(subtotal * pajakPersentase / 100)
+            : 0;
+
+        const serviceCharge =
+            serviceAktif && servicePersentase > 0
+                ? Math.round(
+                    subtotal * servicePersentase / 100
+                )
+                : 0;
+
+        const calculatedTotal =
+            subtotal + pajak + serviceCharge;
+
+        if (Math.round(totalNumber) !== calculatedTotal) {
+            throw new Error(
+                `Total tidak sesuai. Frontend: ${Math.round(totalNumber)}, ` +
+                `backend: ${calculatedTotal} ` +
+                `(subtotal ${subtotal}, pajak ${pajak}, service ${serviceCharge}).`
+            );
+        }
+
+        const activeShiftResult = await client.query(
+            `SELECT id
+             FROM shifts
+             WHERE owner_id = $1
+               AND cashier_id = $2
+               AND status = 'open'
+             FOR UPDATE`,
+            [ownerId, req.user.id]
+        );
+
+        if (activeShiftResult.rows.length === 0) {
+            await client.query("ROLLBACK");
+            transactionStarted = false;
+
+            return res.status(409).json({
+                pesan: "Buka shift kasir terlebih dahulu sebelum menerima pembayaran."
+            });
+        }
+
+        const activeShiftId = activeShiftResult.rows[0].id;
+
+        const reference =
+            `QRIS-SIM-${Date.now()}-${req.user.id}`;
+
+        const transaksiResult = await client.query(
+            `INSERT INTO transaksi (
+                tanggal,
+                total,
+                user_id,
+                shift_id,
+                bayar,
+                payment_status,
+                payment_method,
+                payment_reference,
+                mode_pesanan,
+                subtotal,
+                pajak,
+                service_charge
+            )
+            VALUES (
+                $1, $2, $3, $4, 0, 'pending', 'qris',
+                $5, $6, $7, $8, $9
+            )
+            RETURNING *`,
+            [
+                tanggal,
+                calculatedTotal,
+                ownerId,
+                activeShiftId,
+                reference,
+                mode_pesanan || "dine_in",
+                subtotal,
+                pajak,
+                serviceCharge
+            ]
+        );
+
+        const transaksi = transaksiResult.rows[0];
+
+        for (const item of detailItems) {
+            await client.query(
+                `INSERT INTO transaksi_detail (
+                    transaksi_id,
+                    produk_id,
+                    qty,
+                    harga,
+                    harga_modal,
+                    subtotal
+                )
+                VALUES ($1, $2, $3, $4, $5, $6)`,
+                [
+                    transaksi.id,
+                    item.produkId,
+                    item.qty,
+                    item.harga,
+                    item.hargaModal,
+                    item.subtotalItem
+                ]
+            );
+        }
+
+        await client.query("COMMIT");
+        transactionStarted = false;
+
+        return res.status(201).json({
+            pesan: "Transaksi QRIS berhasil dibuat",
+            transaksiId: transaksi.id,
+            total: transaksi.total,
+            status: "pending",
+            payment_method: "qris",
+            payment_reference: reference,
+            simulator: true,
+            data: transaksi
+        });
+    } catch (error) {
+        if (transactionStarted) {
+            await client.query("ROLLBACK");
+        }
+
+        console.error("ERROR CREATE QRIS:", error);
+
+        return res.status(400).json({
+            pesan: error.message ||
+                "Gagal membuat transaksi QRIS"
+        });
+    } finally {
+        client.release();
+    }
+};
+
+// =====================================================
+// SIMULASI QRIS BERHASIL
+// =====================================================
+
+const simulateQrisPaid = async (req, res) => {
+    const client = await pool.connect();
+    let transactionStarted = false;
+
+    try {
+        if (process.env.QRIS_SIMULATOR !== "true") {
+            return res.status(403).json({
+                pesan: "QRIS simulator tidak aktif"
+            });
+        }
+
+        const userResult = await client.query(
+            `SELECT id, role, owner_id
+             FROM users
+             WHERE id = $1`,
+            [req.user.id]
+        );
+
+        if (userResult.rows.length === 0) {
+            return res.status(401).json({
+                pesan: "User tidak ditemukan"
+            });
+        }
+
+        const user = userResult.rows[0];
+        const ownerId =
+            user.role === "owner" ? user.id : user.owner_id;
+
+        if (!ownerId) {
+            return res.status(403).json({
+                pesan: "User belum memiliki owner"
+            });
+        }
+
+        await client.query("BEGIN");
+        transactionStarted = true;
+
+        const transaksiResult = await client.query(
+            `SELECT *
+             FROM transaksi
+             WHERE id = $1
+               AND user_id = $2
+               AND payment_method = 'qris'
+             FOR UPDATE`,
+            [req.params.id, ownerId]
+        );
+
+        if (transaksiResult.rows.length === 0) {
+            await client.query("ROLLBACK");
+            transactionStarted = false;
+
+            return res.status(404).json({
+                pesan: "Transaksi QRIS tidak ditemukan"
+            });
+        }
+
+        const transaksi = transaksiResult.rows[0];
+
+        // Pemanggilan ulang tidak boleh mengurangi stok lagi.
+        if (transaksi.payment_status === "paid") {
+            await client.query("COMMIT");
+            transactionStarted = false;
+
+            return res.json({
+                pesan: "Transaksi sudah dibayar",
+                transaksiId: transaksi.id,
+                status: "paid"
+            });
+        }
+
+        if (transaksi.payment_status !== "pending") {
+            await client.query("ROLLBACK");
+            transactionStarted = false;
+
+            return res.status(409).json({
+                pesan: "Transaksi bukan berstatus pending"
+            });
+        }
+
+        const detailResult = await client.query(
+            `SELECT produk_id, qty
+             FROM transaksi_detail
+             WHERE transaksi_id = $1
+             ORDER BY id`,
+            [transaksi.id]
+        );
+
+        if (detailResult.rows.length === 0) {
+            throw new Error("Detail transaksi tidak ditemukan");
+        }
+
+        // Kunci semua produk dan validasi stok sebelum menguranginya.
+        const lockedProducts = [];
+
+        for (const item of detailResult.rows) {
+            const produkResult = await client.query(
+                `SELECT id, nama, qty
+                 FROM products
+                 WHERE id = $1 AND user_id = $2
+                 FOR UPDATE`,
+                [item.produk_id, ownerId]
+            );
+
+            if (produkResult.rows.length === 0) {
+                throw new Error("Produk transaksi tidak ditemukan");
+            }
+
+            const produk = produkResult.rows[0];
+            const qty = Number(item.qty);
+
+            if (Number(produk.qty) < qty) {
+                throw new Error(
+                    `Stok ${produk.nama} tidak mencukupi`
+                );
+            }
+
+            lockedProducts.push({
+                id: produk.id,
+                qty
+            });
+        }
+
+        for (const item of lockedProducts) {
+            await client.query(
+                `UPDATE products
+                 SET qty = qty - $1
+                 WHERE id = $2 AND user_id = $3`,
+                [item.qty, item.id, ownerId]
+            );
+        }
+
+        await client.query(
+            `UPDATE transaksi
+             SET payment_status = 'paid',
+                 bayar = total,
+                 payment_id = $1
+             WHERE id = $2`,
+            [`SIM-QRIS-${transaksi.id}`, transaksi.id]
+        );
+
+        await client.query("COMMIT");
+        transactionStarted = false;
+
+        return res.json({
+            pesan: "Simulasi pembayaran QRIS berhasil",
+            transaksiId: transaksi.id,
+            status: "paid"
+        });
+    } catch (error) {
+        if (transactionStarted) {
+            await client.query("ROLLBACK");
+        }
+
+        console.error("ERROR SIMULASI QRIS:", error);
+
+        return res.status(400).json({
+            pesan: error.message || "Simulasi pembayaran gagal"
+        });
+    } finally {
+        client.release();
+    }
+};
+
+// =====================================================
+// GET TRANSAKSI - HANYA DATA OWNER YG LOGIN
+// =====================================================
+
+const getTransaksi = async (req, res) => { 
+    try { 
+        const userResult = await pool.query( 
+            `SELECT id, role, owner_id
+             FROM users
+             WHERE id = $1`,
+            [req.user.id]
+        );
+
+        if (userResult.rows.length === 0) { 
+            return res.status(401).json({ 
+                pesan: "User tidak ditemukan"
+            });
+            
+        }
+
+        const user = userResult.rows[0];
+        const ownerId = 
+            user.role === "owner" ? user.id : user.owner_id;
+
+        if (!ownerId) { 
+            return res.status(403).json({ 
+                pesan: "User belum memiliki owner"
+            });
+        }
+
+        const result = await pool.query( 
+            `SELECT *
+             FROM transaksi
+             WHERE user_id = $1
+             ORDER BY id ASC`,
+            [ownerId]
+        );
+
+        return res.status(200).json({ 
+            pesan: "Data transaksi berhasil ditemukan",
+            data: result.rows
+        });
+    } catch (error) { 
+        console.error("ERROR GET TRANSAKSI:", error);
+
+        return res.status(500).json({ 
+            pesan: "Gagal mengambil transaksi"
+        });
+    }
+};
+
+
+// =====================================================
+// GET TRANSAKSI BY ID
+// =====================================================
+
+const getTransaksiById = async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT *
+             FROM transaksi
+             WHERE id = $1`,
+            [req.params.id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                pesan: "Transaksi tidak ditemukan"
+            });
+        }
+
+        return res.status(200).json({
+            pesan: "Transaksi berhasil ditemukan",
+            data: result.rows[0]
+        });
+    } catch (error) {
+        console.error("ERROR GET TRANSAKSI BY ID:", error);
+
+        return res.status(500).json({
+            pesan: "Gagal mengambil transaksi"
+        });
+    }
+};
+
+// =====================================================
+// UPDATE TRANSAKSI
+// =====================================================
+
+const updateTransaksi = async (req, res) => {
+    try {
+        const { tanggal, total } = req.body;
+
+        if (!tanggal || total === undefined) {
+            return res.status(400).json({
+                pesan: "tanggal dan total wajib diisi"
+            });
+        }
+
+        const result = await pool.query(
+            `UPDATE transaksi
+             SET tanggal = $1, total = $2
+             WHERE id = $3
+             RETURNING *`,
+            [tanggal, total, req.params.id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                pesan: "Transaksi tidak ditemukan"
+            });
+        }
+
+        return res.status(200).json({
+            pesan: "Transaksi berhasil diubah",
+            data: result.rows[0]
+        });
+    } catch (error) {
+        console.error("ERROR UPDATE TRANSAKSI:", error);
+
+        return res.status(500).json({
+            pesan: "Gagal mengubah transaksi"
+        });
+    }
+};
+
+// =====================================================
+// DELETE TRANSAKSI
+// =====================================================
+
+const deleteTransaksi = async (req, res) => {
+    try {
+        const result = await pool.query(
+            `DELETE FROM transaksi
+             WHERE id = $1
+             RETURNING *`,
+            [req.params.id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                pesan: "Transaksi tidak ditemukan"
+            });
+        }
+
+        return res.status(200).json({
+            pesan: "Transaksi berhasil dihapus",
+            data: result.rows[0]
+        });
+    } catch (error) {
+        console.error("ERROR DELETE TRANSAKSI:", error);
+
+        return res.status(500).json({
+            pesan: "Gagal menghapus transaksi"
+        });
+    }
+};
+
+// =====================================================
+// EXPORT
+// =====================================================
+
+module.exports = {
+    createTransaksi,
+    createPembayaran,
+    createQrisPayment,
+    simulateQrisPaid,
+    getTransaksi,
+    getTransaksiById,
+    updateTransaksi,
+    deleteTransaksi
+};

@@ -4,13 +4,15 @@ const router = express.Router();
 
 const {
     getStockMovements,
+    getStockOpnames,
     getProducts,
     getProductById,
     deleteProduct,
     createProduct,
     importProducts,
     updateProduct,
-    tambahStok
+    tambahStok,
+    createStockOpname
    } = require("../controllers/productsController");
 
    const validateProducts = require("../middleware/productsMiddleware");
@@ -25,6 +27,20 @@ router.get(
     "/stock-movements",
     authMiddleware,
     getStockMovements
+);
+
+router.post( 
+    "/stock-opname",
+    authMiddleware,
+    ownerMiddleware,
+    createStockOpname
+);
+
+router.get(
+  "/stock-opname",
+  authMiddleware,
+  ownerMiddleware,
+  getStockOpnames
 );
 
 router.get("/:id", authMiddleware, validateId, getProductById);

@@ -917,16 +917,285 @@ const tambahStok = async (req, res) => {
     }
   }
 };
+
+// =====================================================
+// STOK OPNAME
+// =====================================================
+const createStockOpname = async (req, res) => {
+  let client;
+  let transactionStarted = false;
+
+  try {
+    const actorId = req.user.id;
+    const ownerId = await resolveOwnerId(actorId);
+    const { items, note = null } = req.body;
+
+    if (!ownerId) {
+      return res.status(403).json({
+        pesan: "User belum memiliki owner."
+      });
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({
+        pesan: "Daftar produk opname wajib diisi."
+      });
+    }
+
+    const productIds = [];
+    const seenIds = new Set();
+
+    for (const item of items) {
+      const productId = Number(item.product_id);
+      const stockPhysical = Number(item.stock_physical);
+
+      if (
+        !Number.isSafeInteger(productId) ||
+        productId <= 0 ||
+        !Number.isSafeInteger(stockPhysical) ||
+        stockPhysical < 0
+      ) {
+        return res.status(400).json({
+          pesan: "ID produk harus valid dan stok fisik harus bilangan bulat minimal 0."
+        });
+      }
+
+      if (seenIds.has(productId)) {
+        return res.status(400).json({
+          pesan: "Produk yang sama tidak boleh dimasukkan dua kali."
+        });
+      }
+
+      seenIds.add(productId);
+      productIds.push({
+        productId,
+        stockPhysical
+      });
+    }
+
+    client = await pool.connect();
+
+    await client.query("BEGIN");
+    transactionStarted = true;
+
+    const ids = productIds.map(item => item.productId);
+
+    const productsResult = await client.query(
+      `SELECT id, nama, qty
+       FROM products
+       WHERE id = ANY($1::bigint[])
+         AND user_id = $2
+         AND aktif = true
+       ORDER BY id
+       FOR UPDATE`,
+      [ids, ownerId]
+    );
+
+    if (productsResult.rows.length !== productIds.length) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+
+      return res.status(400).json({
+        pesan: "Sebagian produk tidak ditemukan atau bukan milik owner ini."
+      });
+    }
+
+    const physicalById = new Map(
+      productIds.map(item => [
+        item.productId,
+        item.stockPhysical
+      ])
+    );
+
+    const opnameResult = await client.query(
+      `INSERT INTO stock_opnames (
+        owner_id,
+        user_id,
+        total_items,
+        total_adjustments,
+        note
+      )
+      VALUES ($1, $2, $3, 0, $4)
+      RETURNING id, created_at`,
+      [
+        ownerId,
+        actorId,
+        productIds.length,
+        typeof note === "string" ? note.trim() || null : null
+      ]
+    );
+
+    const opname = opnameResult.rows[0];
+    let totalAdjustments = 0;
+    const details = [];
+
+    for (const product of productsResult.rows) {
+      const productId = Number(product.id);
+      const stockBefore = Number(product.qty);
+      const stockPhysical = physicalById.get(productId);
+      const difference = stockPhysical - stockBefore;
+
+      await client.query(
+        `INSERT INTO stock_opname_details (
+          opname_id,
+          product_id,
+          product_name,
+          stock_system,
+          stock_physical,
+          difference
+        )
+        VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          opname.id,
+          product.id,
+          product.nama,
+          stockBefore,
+          stockPhysical,
+          difference
+        ]
+      );
+
+      if (difference !== 0) {
+        await client.query(
+          `UPDATE products
+           SET qty = $1
+           WHERE id = $2
+             AND user_id = $3`,
+          [stockPhysical, product.id, ownerId]
+        );
+
+        await recordStockMovement(client, {
+          ownerId,
+          productId: product.id,
+          userId: actorId,
+          type: difference > 0 ? "stock_in" : "stock_out",
+          quantity: Math.abs(difference),
+          stockBefore,
+          stockAfter: stockPhysical,
+          sourceType: "stock_opname",
+          sourceId: opname.id,
+          note: `Penyesuaian dari stok opname #${opname.id}`
+        });
+
+        totalAdjustments++;
+      }
+
+      details.push({
+        product_id: product.id,
+        product_name: product.nama,
+        stock_system: stockBefore,
+        stock_physical: stockPhysical,
+        difference
+      });
+    }
+
+    await client.query(
+      `UPDATE stock_opnames
+       SET total_adjustments = $1
+       WHERE id = $2`,
+      [totalAdjustments, opname.id]
+    );
+
+    await client.query("COMMIT");
+    transactionStarted = false;
+
+    return res.status(201).json({
+      pesan: "Stok opname berhasil disimpan.",
+      data: {
+        id: opname.id,
+        created_at: opname.created_at,
+        total_items: details.length,
+        total_adjustments: totalAdjustments,
+        details
+      }
+    });
+  } catch (error) {
+    if (client && transactionStarted) {
+      await client.query("ROLLBACK").catch(() => {});
+    }
+
+    console.error("ERROR CREATE STOCK OPNAME:", error);
+
+    return res.status(500).json({
+      pesan: "Gagal menyimpan stok opname."
+    });
+  } finally {
+    if (client) {
+      client.release();
+    }
+  }
+};
+
+// RIWAYAT STOK OPNAME 
+const getStockOpnames = async (req, res) => { 
+  try { 
+    const actorId = req.user.id; 
+    const ownerId = await resolveOwnerId(actorId);
+
+    if (!ownerId) { 
+      return res.status(403).json({ 
+        pesan: "User belum memiliki owner.", 
+      });
+    }
+
+    const result = await pool.query(
+      `SELECT
+        so.id,
+        so.owner_id,
+        so.user_id,
+        so.total_items,
+        so.total_adjustments,
+        so.note,
+        so.created_at,
+        COALESCE(
+          (
+            SELECT json_agg(
+              json_build_object(
+                'product_id', sod.product_id,
+                'product_name', sod.product_name,
+                'stock_system', sod.stock_system,
+                'stock_physical', sod.stock_physical,
+                'difference', sod.difference
+              )
+              ORDER BY sod.id
+            )
+            FROM stock_opname_details sod
+            WHERE sod.opname_id = so.id
+          ),
+          '[]'::json
+        ) AS details
+      FROM stock_opnames so
+      WHERE so.owner_id = $1
+      ORDER BY so.created_at DESC, so.id DESC
+      LIMIT 100`,
+      [ownerId]
+    );
+
+    return res.status(200).json({ 
+      pesan: "Riwayat stok opname berhasil diambil.",
+      data: result.rows, 
+    });
+  } catch (error) { 
+    console.error("ERROR GET STOCK OPNAME:", error);
+
+    return res.status(500).json({ 
+      pesan: "Gagal mengambil riwayat stock opname.",
+    })
+  }
+}
+
 // =====================================================
 // EXPORT
 // =====================================================
 module.exports = {
   getStockMovements,
+  getStockOpnames,
   getProducts,
   getProductById,
   deleteProduct,
   createProduct,
   importProducts,
   updateProduct,
-  tambahStok
+  tambahStok,
+  createStockOpname
 };

@@ -5,9 +5,34 @@ const pool = require("../config/database");
 const authMiddleware = require("../middleware/authMiddleware");
 
 const PLANS = [
-    { id: "starter", name: "Starter", price: 99000, duration_days: 30 },
-    { id: "pro", name: "Pro", price: 199000, duration_days: 30 },
-    { id: "enterprise", name: "Enterprise", price: 449000, duration_days: 30 },
+    { 
+        id: "free",
+        name: "Free",
+        price: 0,
+        duration_days: 30,
+        limits: { products: 20, cashiers: 1 },
+    },
+    {
+        id: "starter",
+        name: "Starter",
+        price: 99000,
+        duration_days: 30,
+        limits: { products: 100, cashiers: 3 },
+    },
+    {
+        id: "pro",
+        name: "Pro",
+        price: 199000,
+        duration_days: 30,
+        limits: { products: 1000, cashiers: 10 },
+    },
+    {
+        id: "enterprise",
+        name: "Enterprise",
+        price: 449000,
+        duration_days: 30,
+        limits: { products: null, cashiers: 30 },
+    },
 ];
 
 async function ensureTable() {
@@ -17,7 +42,7 @@ async function ensureTable() {
             owner_id INTEGER NOT NULL UNIQUE
                 REFERENCES users(id) ON DELETE CASCADE,
             plan VARCHAR(30) NOT NULL DEFAULT 'trial'
-                CHECK (plan IN ('trial', 'starter', 'pro', 'enterprise')),
+                CHECK (plan IN ('trial', 'free', 'starter', 'pro', 'enterprise')),
             status VARCHAR(20) NOT NULL DEFAULT 'trialing'
                 CHECK (status IN ('trialing', 'active', 'expired', 'pending')),
             started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -25,6 +50,17 @@ async function ensureTable() {
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
+    `);
+
+    await pool.query(`
+        ALTER TABLE subscriptions
+        DROP CONSTRAINT IF EXISTS subscriptions_plan_check
+    `);
+
+    await pool.query(`
+        ALTER TABLE subscriptions
+        ADD CONSTRAINT subscriptions_plan_check
+        CHECK (plan IN ('trial', 'free', 'starter', 'pro', 'enterprise'))
     `);
 }
 
@@ -51,6 +87,16 @@ router.get("/me", authMiddleware, async (req, res) => {
                 pesan: "Akun tidak terhubung ke pemilik usaha",
             });
         }
+
+                await pool.query(
+            `INSERT INTO subscriptions
+                (owner_id, plan, status, started_at, expires_at)
+             VALUES
+                ($1, 'trial', 'trialing', NOW(),
+                 NOW() + INTERVAL '14 days')
+             ON CONFLICT (owner_id) DO NOTHING`,
+            [ownerId]
+        );
 
         const result = await pool.query(
             `SELECT owner_id, plan, status, started_at, expires_at,
