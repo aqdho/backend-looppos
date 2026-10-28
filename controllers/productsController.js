@@ -48,30 +48,33 @@ const getStockMovements = async (req, res) => {
       });
     }
 
+    
     const result = await pool.query(
-      `SELECT
-         sm.id,
-         sm.product_id,
-         p.nama AS nama_produk,
-         sm.user_id,
-         sm.movement_type,
-         sm.quantity,
-         sm.stock_before,
-         sm.stock_after,
-         sm.source_type,
-         sm.source_id,
-         sm.note,
-         sm.created_at
-       FROM stock_movements sm
-       LEFT JOIN products p
-         ON p.id = sm.product_id
-        AND p.user_id = sm.owner_id
-       WHERE sm.owner_id = $1
-         AND ($2::BIGINT IS NULL OR sm.product_id = $2)
-       ORDER BY sm.created_at DESC, sm.id DESC
-       LIMIT $3`,
-      [ownerId, productId, limit]
-    );
+    `SELECT
+        sm.id,
+        sm.product_id,
+        p.nama AS nama_produk,
+        p.gambar AS gambar,
+        sm.user_id,
+        sm.movement_type,
+        sm.quantity,
+        sm.stock_before,
+        sm.stock_after,
+        sm.source_type,
+        sm.source_id,
+        sm.note,
+        sm.created_at
+    FROM stock_movements sm
+    LEFT JOIN products p
+      ON p.id = sm.product_id
+      AND p.user_id = sm.owner_id
+    WHERE sm.owner_id = $1
+      AND ($2::BIGINT IS NULL OR sm.product_id = $2)
+    ORDER BY sm.created_at DESC, sm.id DESC
+    LIMIT $3`,
+    [ownerId, productId, limit]
+  );
+
 
     return res.status(200).json({
       pesan: "Riwayat pergerakan stok berhasil ditemukan.",
@@ -946,8 +949,20 @@ const createStockOpname = async (req, res) => {
     const seenIds = new Set();
 
     for (const item of items) {
-      const productId = Number(item.product_id);
-      const stockPhysical = Number(item.stock_physical);
+  if (
+    !item ||
+    typeof item !== "object" ||
+    Array.isArray(item)
+  ) {
+    return res.status(400).json({
+      pesan: "Setiap item opname harus berupa objek produk yang valid."
+    });
+  }
+
+  const productId = Number(item.product_id);
+  const stockPhysical = Number(item.stock_physical);
+
+  // Lanjutkan validasi yang sudah ada di bawahnya.
 
       if (
         !Number.isSafeInteger(productId) ||
