@@ -119,10 +119,17 @@ router.get(
     "/struk-gambar/:transaksi_id",
     authMiddleware,
     async (req, res) => {
-
         try {
             const transaksiId = req.params.transaksi_id;
             const userId = req.user.id;
+
+            const jenisStruk = [
+                "users",
+                "table",
+                "kitchen"
+            ].includes(req.query.jenis_struk)
+                ? req.query.jenis_struk
+                : "users";
 
             const transaksiResult = await pool.query(
                 `
@@ -215,16 +222,10 @@ router.get(
                 settings.pesan_struk || ""
             );
 
-            const detailTinggi =
-                detailResult.rows.length * 45;
-
-            const tinggi =
-                500 + detailTinggi;
-
             let y = 80;
-
             let teks = "";
 
+            // HEADER TOKO
             teks += `
                 <text
                     x="300"
@@ -291,15 +292,14 @@ router.get(
 
             y += 40;
 
+            // DETAIL PRODUK
             for (const item of detailResult.rows) {
+                const nama = escapeXml(item.nama);
 
-                const nama = escapeXml(
-                    `${item.nama} x${item.qty}`
-                );
-
-                const subtotal = escapeXml(
-                    formatRp(item.subtotal)
-                );
+                const informasiKanan =
+                    jenisStruk === "kitchen"
+                        ? `JUMLAH: ${item.qty}`
+                        : formatRp(item.subtotal);
 
                 teks += `
                     <text
@@ -317,7 +317,7 @@ router.get(
                         font-size="20"
                         font-family="Arial"
                         fill="black"
-                    >${subtotal}</text>
+                    >${escapeXml(informasiKanan)}</text>
                 `;
 
                 y += 45;
@@ -325,6 +325,7 @@ router.get(
 
             y += 10;
 
+            // PEMISAH DETAIL PRODUK
             teks += `
                 <line
                     x1="30"
@@ -338,71 +339,78 @@ router.get(
 
             y += 40;
 
-            teks += `
-                <text
-                    x="30"
-                    y="${y}"
-                    font-size="22"
-                    font-family="Arial"
-                    font-weight="bold"
-                    fill="black"
-                >Total</text>
+            // TOTAL UNTUK STRUK PEMBAYARAN DAN TAGIHAN
+            if (jenisStruk !== "kitchen") {
+                teks += `
+                    <text
+                        x="30"
+                        y="${y}"
+                        font-size="22"
+                        font-family="Arial"
+                        font-weight="bold"
+                        fill="black"
+                    >${jenisStruk === "table" ? "Total Tagihan" : "Total"}</text>
 
-                <text
-                    x="570"
-                    y="${y}"
-                    text-anchor="end"
-                    font-size="22"
-                    font-family="Arial"
-                    font-weight="bold"
-                    fill="black"
-                >${escapeXml(formatRp(total))}</text>
-            `;
+                    <text
+                        x="570"
+                        y="${y}"
+                        text-anchor="end"
+                        font-size="22"
+                        font-family="Arial"
+                        font-weight="bold"
+                        fill="black"
+                    >${escapeXml(formatRp(total))}</text>
+                `;
 
-            y += 40;
+                y += 40;
 
-            teks += `
-                <text
-                    x="30"
-                    y="${y}"
-                    font-size="20"
-                    font-family="Arial"
-                    fill="black"
-                >Bayar</text>
+                // BAYAR DAN KEMBALIAN HANYA UNTUK STRUK PEMBAYARAN
+                if (jenisStruk === "users") {
+                    teks += `
+                        <text
+                            x="30"
+                            y="${y}"
+                            font-size="20"
+                            font-family="Arial"
+                            fill="black"
+                        >Bayar</text>
 
-                <text
-                    x="570"
-                    y="${y}"
-                    text-anchor="end"
-                    font-size="20"
-                    font-family="Arial"
-                    fill="black"
-                >${escapeXml(formatRp(bayar))}</text>
-            `;
+                        <text
+                            x="570"
+                            y="${y}"
+                            text-anchor="end"
+                            font-size="20"
+                            font-family="Arial"
+                            fill="black"
+                        >${escapeXml(formatRp(bayar))}</text>
+                    `;
 
-            y += 40;
+                    y += 40;
 
-            teks += `
-                <text
-                    x="30"
-                    y="${y}"
-                    font-size="20"
-                    font-family="Arial"
-                    fill="black"
-                >Kembali</text>
+                    teks += `
+                        <text
+                            x="30"
+                            y="${y}"
+                            font-size="20"
+                            font-family="Arial"
+                            fill="black"
+                        >Kembali</text>
 
-                <text
-                    x="570"
-                    y="${y}"
-                    text-anchor="end"
-                    font-size="20"
-                    font-family="Arial"
-                    fill="black"
-                >${escapeXml(formatRp(kembali))}</text>
-            `;
+                        <text
+                            x="570"
+                            y="${y}"
+                            text-anchor="end"
+                            font-size="20"
+                            font-family="Arial"
+                            fill="black"
+                        >${escapeXml(formatRp(kembali))}</text>
+                    `;
 
-            y += 45;
+                    y += 45;
+                }
+            }
 
+            // FOOTER
             teks += `
                 <line
                     x1="30"
@@ -459,7 +467,6 @@ router.get(
             res.send(image);
 
         } catch (error) {
-
             console.error(
                 "ERROR GAMBAR STRUK:",
                 error
